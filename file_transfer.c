@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 
 #define PROTO_MAGIC     0x50325000
 #define TYPE_TEXT       0x01
@@ -90,24 +89,22 @@ int transfer_send_quit(SOCKET sock) {
     return send_msg(sock, TYPE_QUIT, NULL, 0);
 }
 
-// Loop di ricezione per un socket: chiamato da un thread dedicato.
-// Stampa messaggi di testo, salva file, e se riceve QUIT o errore, esce.
 void *transfer_receive_loop(void *arg) {
     SOCKET sock = *(SOCKET*)arg;
-    free(arg);  // libera la memoria allocata per il socket
+    free(arg);
 
     while (1) {
         uint8_t type;
         void *payload = NULL;
         uint32_t plen;
-        if (recv_msg(sock, &type, &payload, &plen) < 0) {
-            break; // errore o connessione chiusa
-        }
+        if (recv_msg(sock, &type, &payload, &plen) < 0) break;
+        
         switch (type) {
             case TYPE_TEXT:
-                printf("\n[Messaggio da peer]: %.*s\n> ", plen, (char*)payload);
+                printf("\n💬 [Messaggio]: %.*s\n> ", plen, (char*)payload);
                 fflush(stdout);
                 break;
+                
             case TYPE_FILE_REQ: {
                 uint16_t name_len;
                 memcpy(&name_len, payload, 2);
@@ -116,8 +113,8 @@ void *transfer_receive_loop(void *arg) {
                 filename[name_len] = '\0';
                 uint64_t fsize;
                 memcpy(&fsize, (uint8_t*)payload+2+name_len, 8);
-                printf("\nRicezione file: %s (%llu byte)\n> ", filename, (unsigned long long)fsize);
-                fflush(stdout);
+                printf("\n📥 Ricezione file: %s (%llu byte)\n", filename, (unsigned long long)fsize);
+                
                 FILE *f = fopen(filename, "wb");
                 if (!f) {
                     uint64_t remaining = fsize;
@@ -143,22 +140,18 @@ void *transfer_receive_loop(void *arg) {
                         free(p2);
                     }
                     fclose(f);
-                    if (received == fsize)
-                        printf("File %s ricevuto correttamente.\n> ", filename);
-                    else
-                        printf("Trasferimento %s incompleto.\n> ", filename);
-                    fflush(stdout);
+                    printf("✅ File %s ricevuto (%llu/%llu byte)\n> ", 
+                           filename, (unsigned long long)received, (unsigned long long)fsize);
                 }
+                fflush(stdout);
                 break;
             }
+            
             case TYPE_QUIT:
-                printf("\nPeer ha chiuso la connessione.\n> ");
+                printf("\n👋 Peer ha chiuso la connessione.\n> ");
                 fflush(stdout);
                 free(payload);
                 goto cleanup;
-            default:
-                printf("\nMessaggio sconosciuto (tipo %02x)\n> ", type);
-                fflush(stdout);
         }
         free(payload);
     }

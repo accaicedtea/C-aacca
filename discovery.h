@@ -1,13 +1,14 @@
 #ifndef DISCOVERY_H
 #define DISCOVERY_H
 
-#define DISCOVERY_PORT 9000   // UDP broadcast port
+#define DISCOVERY_PORT 9001  // Porta UDP per discovery
 
-// Avvia il thread di discovery (beacon + listener).
-// tcp_port: porta su cui il peer ascolta le connessioni TCP.
-void discovery_start(unsigned short tcp_port);
+// Avvia il discovery (beacon + listener)
+// my_name: nome identificativo del peer
+// tcp_port: porta TCP su cui si ascolta
+void discovery_start(const char *my_name, unsigned short tcp_port);
 
-// Ferma il discovery e libera le risorse.
+// Ferma il discovery
 void discovery_stop(void);
 
 #endif

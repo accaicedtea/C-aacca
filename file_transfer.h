@@ -1,6 +1,8 @@
 #ifndef FILE_TRANSFER_H
 #define FILE_TRANSFER_H
 
+#include <stdint.h>
+
 #ifdef _WIN32
     #include <winsock2.h>
 #else
@@ -16,7 +18,7 @@
 
 int transfer_send_message(SOCKET sock, const char *text);
 int transfer_send_file(SOCKET sock, const char *filename);
-void *transfer_receive_loop(void *arg);  // firma corretta per pthread
+void *transfer_receive_loop(void *arg);
 int transfer_send_quit(SOCKET sock);
 
 #endif
