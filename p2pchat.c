@@ -5,11 +5,13 @@
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <ifaddrs.h>
 
 // ==================== PROTOCOLLO ====================
 #define PROTO_MAGIC     0x50325000
@@ -18,6 +20,8 @@
 #define TYPE_FILE_DATA  0x03
 #define TYPE_FILE_END   0x04
 #define TYPE_QUIT       0xFF
+#define TYPE_PING       0x10
+#define TYPE_PONG       0x11
 #define CHUNK_SIZE      8192
 
 // ==================== CONFIGURAZIONE ====================
@@ -25,6 +29,8 @@
 #define DISCOVERY_PORT  9001
 #define MAX_PEERS       32
 #define MAX_NAME        32
+#define HEARTBEAT_INTERVAL  5
+#define HEARTBEAT_TIMEOUT   15
 
 // ==================== TIPI ====================
 typedef struct {
@@ -33,6 +39,8 @@ typedef struct {
     char ip[16];
     unsigned short port;
     int active;
+    time_t last_seen;
+    int awaiting_pong;
 } Peer;
 
 // ==================== STATO GLOBALE ====================
@@ -43,9 +51,6 @@ static volatile int running = 1;
 static char my_name[MAX_NAME];
 
 // ==================== UTILITÀ ====================
-static uint32_t htonl_local(uint32_t x) { return htonl(x); }
-static uint32_t ntohl_local(uint32_t x) { return ntohl(x); }
-
 static int send_all(int sock, const void *buf, int len) {
     int sent = 0;
     while (sent < len) {
@@ -68,8 +73,8 @@ static int recv_all(int sock, void *buf, int len) {
 
 // ==================== PROTOCOLLO MESSAGGI ====================
 static int send_msg(int sock, uint8_t type, const void *payload, uint32_t len) {
-    uint32_t magic = htonl_local(PROTO_MAGIC);
-    uint32_t netlen = htonl_local(len);
+    uint32_t magic = htonl(PROTO_MAGIC);
+    uint32_t netlen = htonl(len);
     uint8_t hdr[9];
     memcpy(hdr, &magic, 4);
     hdr[4] = type;
@@ -85,11 +90,12 @@ static int recv_msg(int sock, uint8_t *type, uint8_t **payload, uint32_t *len) {
     
     uint32_t magic;
     memcpy(&magic, hdr, 4);
-    if (ntohl_local(magic) != PROTO_MAGIC) return -1;
+    magic = ntohl(magic);
+    if (magic != PROTO_MAGIC) return -1;
     
     *type = hdr[4];
     memcpy(len, hdr + 5, 4);
-    *len = ntohl_local(*len);
+    *len = ntohl(*len);
     
     if (*len > 0) {
         *payload = malloc(*len);
@@ -105,11 +111,24 @@ static int recv_msg(int sock, uint8_t *type, uint8_t **payload, uint32_t *len) {
 }
 
 // ==================== GESTIONE PEER ====================
-
 static int add_peer(const char *name, const char *ip, unsigned short port, int sock) {
     pthread_mutex_lock(&peer_mutex);
     
-    // Cerca slot libero
+    // Cerca se già esiste
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].active && strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
+            // Aggiorna
+            snprintf(peers[i].name, MAX_NAME, "%s", name);
+            close(peers[i].sock);
+            peers[i].sock = sock;
+            peers[i].last_seen = time(NULL);
+            peers[i].awaiting_pong = 0;
+            pthread_mutex_unlock(&peer_mutex);
+            return i;
+        }
+    }
+    
+    // Nuovo slot
     int idx = -1;
     for (int i = 0; i < MAX_PEERS; i++) {
         if (!peers[i].active) {
@@ -119,6 +138,7 @@ static int add_peer(const char *name, const char *ip, unsigned short port, int s
     }
     
     if (idx == -1) {
+        close(sock);
         pthread_mutex_unlock(&peer_mutex);
         return -1;
     }
@@ -128,6 +148,8 @@ static int add_peer(const char *name, const char *ip, unsigned short port, int s
     peers[idx].port = port;
     peers[idx].sock = sock;
     peers[idx].active = 1;
+    peers[idx].last_seen = time(NULL);
+    peers[idx].awaiting_pong = 0;
     peer_count++;
     
     printf("\n✅ Connesso a: %s (%s:%d)\n", name, ip, port);
@@ -138,7 +160,7 @@ static int add_peer(const char *name, const char *ip, unsigned short port, int s
     return idx;
 }
 
-static void remove_peer_by_sock(int sock) {
+static void remove_peer(int sock) {
     pthread_mutex_lock(&peer_mutex);
     for (int i = 0; i < MAX_PEERS; i++) {
         if (peers[i].active && peers[i].sock == sock) {
@@ -153,33 +175,49 @@ static void remove_peer_by_sock(int sock) {
     pthread_mutex_unlock(&peer_mutex);
 }
 
-// ==================== DISCOVERY UDP ====================
-static void *discovery_sender(void *arg) {
+// ==================== HEARTBEAT ====================
+static void *heartbeat_thread(void *arg) {
     (void)arg;
     
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    int broadcast = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(DISCOVERY_PORT);
-    addr.sin_addr.s_addr = inet_addr("255.255.255.255");
-    
-    char msg[128];
-    
     while (running) {
-        snprintf(msg, sizeof(msg), "P2P|%s|%d", my_name, TCP_PORT);
-        sendto(sock, msg, strlen(msg), 0, (struct sockaddr*)&addr, sizeof(addr));
-        sleep(2);
+        sleep(HEARTBEAT_INTERVAL);
+        
+        pthread_mutex_lock(&peer_mutex);
+        time_t now = time(NULL);
+        
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (!peers[i].active) continue;
+            
+            // Peer morto?
+            if (peers[i].awaiting_pong && (now - peers[i].last_seen) > HEARTBEAT_TIMEOUT) {
+                printf("\n⚠️  Peer %s non risponde, rimosso\n> ", peers[i].name);
+                fflush(stdout);
+                close(peers[i].sock);
+                peers[i].active = 0;
+                peer_count--;
+                continue;
+            }
+            
+            // Invia ping
+            if (!peers[i].awaiting_pong) {
+                if (send_msg(peers[i].sock, TYPE_PING, NULL, 0) == 0) {
+                    peers[i].awaiting_pong = 1;
+                } else {
+                    close(peers[i].sock);
+                    peers[i].active = 0;
+                    peer_count--;
+                }
+            }
+        }
+        pthread_mutex_unlock(&peer_mutex);
     }
-    
-    close(sock);
     return NULL;
 }
 
-static void *discovery_listener(void *arg) {
+// ==================== DISCOVERY UDP ====================
+// Il discovery ora fa: broadcast -> aspetta risposta UDP -> solo se risponde, connette TCP
+
+static void *discovery_responder(void *arg) {
     (void)arg;
     
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -191,7 +229,11 @@ static void *discovery_listener(void *arg) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(DISCOVERY_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
-    bind(sock, (struct sockaddr*)&addr, sizeof(addr));
+    
+    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        return NULL;
+    }
     
     char buf[256];
     struct sockaddr_in sender;
@@ -205,41 +247,118 @@ static void *discovery_listener(void *arg) {
         
         buf[n] = '\0';
         
-        char name[MAX_NAME], ip[16];
-        unsigned int port;
+        // Se riceve "P2P_DISCOVER", risponde con "P2P_HERE|nome|porta"
+        if (strcmp(buf, "P2P_DISCOVER") == 0) {
+            char response[128];
+            snprintf(response, sizeof(response), "P2P_HERE|%s|%d", my_name, TCP_PORT);
+            sendto(sock, response, strlen(response), 0, 
+                   (struct sockaddr*)&sender, sizeof(sender));
+        }
+    }
+    
+    close(sock);
+    return NULL;
+}
+
+static void *discovery_seeker(void *arg) {
+    (void)arg;
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    
+    // Timeout per recvfrom
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    struct sockaddr_in broadcast_addr;
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(DISCOVERY_PORT);
+    broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
+    
+    struct sockaddr_in responder;
+    socklen_t responder_len;
+    char buf[256];
+    
+    while (running) {
+        // Invia discover
+        sendto(sock, "P2P_DISCOVER", 12, 0, 
+               (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
         
-        if (sscanf(buf, "P2P|%31[^|]|%u", name, &port) != 2) continue;
-        
-        inet_ntop(AF_INET, &sender.sin_addr, ip, sizeof(ip));
-        
-        // Ignora se stessi
-        if (strcmp(ip, "127.0.0.1") == 0 && port == TCP_PORT) continue;
-        
-        pthread_mutex_lock(&peer_mutex);
-        int exists = 0;
-        for (int i = 0; i < MAX_PEERS; i++) {
-            if (peers[i].active && strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
-                exists = 1;
-                break;
+        // Ascolta risposte per 2 secondi
+        time_t start = time(NULL);
+        while (time(NULL) - start < 2) {
+            responder_len = sizeof(responder);
+            int n = recvfrom(sock, buf, sizeof(buf) - 1, 0,
+                            (struct sockaddr*)&responder, &responder_len);
+            if (n <= 0) continue;
+            
+            buf[n] = '\0';
+            
+            char name[MAX_NAME], ip[16];
+            unsigned int port;
+            
+            if (sscanf(buf, "P2P_HERE|%31[^|]|%u", name, &port) != 2) continue;
+            
+            inet_ntop(AF_INET, &responder.sin_addr, ip, sizeof(ip));
+            
+            // Ignora se stessi
+            if (port == TCP_PORT) {
+                // Controlla se è localhost
+                if (strcmp(ip, "127.0.0.1") == 0) continue;
+                
+                // Controlla IP locale
+                char my_ip[16];
+                struct ifaddrs *ifaddr, *ifa;
+                if (getifaddrs(&ifaddr) == 0) {
+                    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+                        if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                            struct sockaddr_in *sin = (struct sockaddr_in*)ifa->ifa_addr;
+                            inet_ntop(AF_INET, &sin->sin_addr, my_ip, sizeof(my_ip));
+                            if (strcmp(ip, my_ip) == 0) {
+                                freeifaddrs(ifaddr);
+                                goto skip;
+                            }
+                        }
+                    }
+                    freeifaddrs(ifaddr);
+                }
             }
+            
+            // Verifica se già connesso
+            pthread_mutex_lock(&peer_mutex);
+            int exists = 0;
+            for (int i = 0; i < MAX_PEERS; i++) {
+                if (peers[i].active && strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
+                    exists = 1;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&peer_mutex);
+            
+            if (exists) continue;
+            
+            // Connetti via TCP
+            int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in tcp_addr;
+            memset(&tcp_addr, 0, sizeof(tcp_addr));
+            tcp_addr.sin_family = AF_INET;
+            tcp_addr.sin_port = htons(port);
+            inet_pton(AF_INET, ip, &tcp_addr.sin_addr);
+            
+            if (connect(tcp_sock, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) == 0) {
+                add_peer(name, ip, port, tcp_sock);
+            } else {
+                close(tcp_sock);
+            }
+            
+            skip:;
         }
-        pthread_mutex_unlock(&peer_mutex);
         
-        if (exists) continue;
-        
-        // Connetti via TCP
-        int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in tcp_addr;
-        memset(&tcp_addr, 0, sizeof(tcp_addr));
-        tcp_addr.sin_family = AF_INET;
-        tcp_addr.sin_port = htons(port);
-        inet_pton(AF_INET, ip, &tcp_addr.sin_addr);
-        
-        if (connect(tcp_sock, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) == 0) {
-            add_peer(name, ip, port, tcp_sock);
-        } else {
-            close(tcp_sock);
-        }
+        sleep(3);  // Ripeti ogni 3 secondi
     }
     
     close(sock);
@@ -259,9 +378,28 @@ static void *tcp_receiver(void *arg) {
         if (recv_msg(sock, &type, &payload, &plen) < 0) break;
         
         switch (type) {
+            case TYPE_PING:
+                send_msg(sock, TYPE_PONG, NULL, 0);
+                free(payload);
+                break;
+                
+            case TYPE_PONG:
+                pthread_mutex_lock(&peer_mutex);
+                for (int i = 0; i < MAX_PEERS; i++) {
+                    if (peers[i].active && peers[i].sock == sock) {
+                        peers[i].last_seen = time(NULL);
+                        peers[i].awaiting_pong = 0;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&peer_mutex);
+                free(payload);
+                break;
+                
             case TYPE_TEXT:
                 printf("\n💬 Messaggio: %.*s\n> ", plen, (char*)payload);
                 fflush(stdout);
+                free(payload);
                 break;
                 
             case TYPE_FILE_REQ: {
@@ -273,6 +411,7 @@ static void *tcp_receiver(void *arg) {
                 
                 uint64_t fsize;
                 memcpy(&fsize, payload + 2 + name_len, 8);
+                free(payload);
                 
                 printf("\n📥 File in arrivo: %s (%llu bytes)\n> ", 
                        filename, (unsigned long long)fsize);
@@ -307,12 +446,15 @@ static void *tcp_receiver(void *arg) {
             case TYPE_QUIT:
                 free(payload);
                 goto done;
+                
+            default:
+                free(payload);
+                break;
         }
-        free(payload);
     }
     
 done:
-    remove_peer_by_sock(sock);
+    remove_peer(sock);
     return NULL;
 }
 
@@ -332,16 +474,11 @@ static void *tcp_server(void *arg) {
     bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr));
     listen(listen_sock, 10);
     
-    printf("Server TCP in ascolto sulla porta %d\n", TCP_PORT);
-    
     while (running) {
         struct sockaddr_in client_addr;
         socklen_t len = sizeof(client_addr);
         int client = accept(listen_sock, (struct sockaddr*)&client_addr, &len);
         if (client < 0) continue;
-        
-        char ip[16];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
         
         pthread_t tid;
         int *sock_ptr = malloc(sizeof(int));
@@ -354,18 +491,32 @@ static void *tcp_server(void *arg) {
     return NULL;
 }
 
-// ==================== MENU PRINCIPALE ====================
+// ==================== MENU ====================
 static void show_peers(void) {
     pthread_mutex_lock(&peer_mutex);
     printf("\n┌─ Peer connessi ─────────────────────────────┐\n");
-    if (peer_count == 0) {
-        printf("│  Nessun peer connesso                       │\n");
+    
+    int active_count = 0;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers[i].active) active_count++;
+    }
+    
+    if (active_count == 0) {
+        printf("│  Nessun peer trovato                        │\n");
     } else {
         int idx = 0;
+        time_t now = time(NULL);
         for (int i = 0; i < MAX_PEERS; i++) {
             if (peers[i].active) {
-                printf("│ [%d] %-20s %-15s │\n", 
-                       idx++, peers[i].name, peers[i].ip);
+                int idle = now - peers[i].last_seen;
+                char status[32];
+                if (idle < HEARTBEAT_INTERVAL)
+                    snprintf(status, sizeof(status), "🟢 attivo");
+                else
+                    snprintf(status, sizeof(status), "🟡 %ds", idle);
+                
+                printf("│ [%d] %-15s %-15s %s │\n", 
+                       idx++, peers[i].name, peers[i].ip, status);
             }
         }
     }
@@ -376,7 +527,6 @@ static void show_peers(void) {
 static int select_peer(void) {
     pthread_mutex_lock(&peer_mutex);
     
-    // Costruisci array di peer attivi
     int active_indices[MAX_PEERS];
     int active_count = 0;
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -392,7 +542,6 @@ static int select_peer(void) {
         return -1;
     }
     
-    // Mostra elenco
     printf("\n┌─ Seleziona peer ────────────────────────────┐\n");
     for (int i = 0; i < active_count; i++) {
         int idx = active_indices[i];
@@ -414,7 +563,6 @@ static int select_peer(void) {
 
 // ==================== MAIN ====================
 int main(void) {
-    // Nome host
     gethostname(my_name, sizeof(my_name));
     my_name[sizeof(my_name) - 1] = '\0';
     
@@ -423,28 +571,31 @@ int main(void) {
     printf("║  Nome: %-32s ║\n", my_name);
     printf("╚══════════════════════════════════════════╝\n\n");
     
-    // Avvia server TCP
+    // Server TCP
     pthread_t server_tid;
     pthread_create(&server_tid, NULL, tcp_server, NULL);
     
-    // Avvia discovery
-    pthread_t disc_send, disc_recv;
-    pthread_create(&disc_send, NULL, discovery_sender, NULL);
-    pthread_create(&disc_recv, NULL, discovery_listener, NULL);
+    // Discovery: chi risponde e chi cerca
+    pthread_t disc_resp, disc_seek;
+    pthread_create(&disc_resp, NULL, discovery_responder, NULL);
+    pthread_create(&disc_seek, NULL, discovery_seeker, NULL);
+    
+    // Heartbeat
+    pthread_t hb_tid;
+    pthread_create(&hb_tid, NULL, heartbeat_thread, NULL);
     
     sleep(1);
     
-    // Menu
     char input[1024];
     
     while (running) {
         printf("\n┌─ Menu ────────────────────────────────────┐\n");
-        printf("│ 1. Mostra peer                            │\n");
-        printf("│ 2. Invia messaggio                        │\n");
-        printf("│ 3. Invia file                             │\n");
-        printf("│ 4. Broadcast messaggio                    │\n");
-        printf("│ 5. Broadcast file                         │\n");
-        printf("│ 0. Esci                                   │\n");
+        printf("│ 1. Mostra peer e stato                   │\n");
+        printf("│ 2. Invia messaggio a peer                │\n");
+        printf("│ 3. Invia file a peer                     │\n");
+        printf("│ 4. Broadcast messaggio                   │\n");
+        printf("│ 5. Broadcast file                        │\n");
+        printf("│ 0. Esci                                  │\n");
         printf("└────────────────────────────────────────────┘\n");
         printf("> ");
         fflush(stdout);
@@ -466,13 +617,15 @@ int main(void) {
             case 2: {
                 int idx = select_peer();
                 if (idx >= 0) {
-                    printf("Messaggio: ");
+                    printf("Messaggio per %s: ", peers[idx].name);
                     fflush(stdout);
                     if (fgets(input, sizeof(input), stdin)) {
                         input[strcspn(input, "\n")] = '\0';
                         if (strlen(input) > 0) {
-                            send_msg(peers[idx].sock, TYPE_TEXT, input, strlen(input));
-                            printf("✅ Inviato a %s\n", peers[idx].name);
+                            if (send_msg(peers[idx].sock, TYPE_TEXT, input, strlen(input)) == 0)
+                                printf("✅ Inviato\n");
+                            else
+                                printf("❌ Invio fallito\n");
                         }
                     }
                 }
@@ -495,25 +648,28 @@ int main(void) {
                                 long fsize = ftell(f);
                                 rewind(f);
                                 
-                                // Header
                                 uint16_t name_len = strlen(input);
                                 uint8_t *req = malloc(2 + name_len + 8);
                                 memcpy(req, &name_len, 2);
                                 memcpy(req + 2, input, name_len);
                                 uint64_t fsize64 = fsize;
                                 memcpy(req + 2 + name_len, &fsize64, 8);
-                                send_msg(peers[idx].sock, TYPE_FILE_REQ, req, 2 + name_len + 8);
-                                free(req);
                                 
-                                // Dati
-                                uint8_t chunk[CHUNK_SIZE];
-                                size_t n;
-                                while ((n = fread(chunk, 1, CHUNK_SIZE, f)) > 0) {
-                                    send_msg(peers[idx].sock, TYPE_FILE_DATA, chunk, n);
+                                if (send_msg(peers[idx].sock, TYPE_FILE_REQ, req, 2 + name_len + 8) == 0) {
+                                    free(req);
+                                    
+                                    uint8_t chunk[CHUNK_SIZE];
+                                    size_t n;
+                                    while ((n = fread(chunk, 1, CHUNK_SIZE, f)) > 0) {
+                                        if (send_msg(peers[idx].sock, TYPE_FILE_DATA, chunk, n) < 0) break;
+                                    }
+                                    send_msg(peers[idx].sock, TYPE_FILE_END, NULL, 0);
+                                    printf("✅ File inviato\n");
+                                } else {
+                                    free(req);
+                                    printf("❌ Invio fallito\n");
                                 }
-                                send_msg(peers[idx].sock, TYPE_FILE_END, NULL, 0);
                                 fclose(f);
-                                printf("✅ File inviato a %s\n", peers[idx].name);
                             }
                         }
                     }
@@ -527,14 +683,16 @@ int main(void) {
                 if (fgets(input, sizeof(input), stdin)) {
                     input[strcspn(input, "\n")] = '\0';
                     if (strlen(input) > 0) {
+                        int sent = 0;
                         pthread_mutex_lock(&peer_mutex);
                         for (int i = 0; i < MAX_PEERS; i++) {
-                            if (peers[i].active) {
-                                send_msg(peers[i].sock, TYPE_TEXT, input, strlen(input));
+                            if (peers[i].active && peers[i].awaiting_pong == 0) {
+                                if (send_msg(peers[i].sock, TYPE_TEXT, input, strlen(input)) == 0)
+                                    sent++;
                             }
                         }
                         pthread_mutex_unlock(&peer_mutex);
-                        printf("✅ Broadcast inviato\n");
+                        printf("✅ Inviato a %d peer attivi\n", sent);
                     }
                 }
                 break;
@@ -554,30 +712,33 @@ int main(void) {
                             long fsize = ftell(f);
                             rewind(f);
                             
+                            int sent = 0;
                             pthread_mutex_lock(&peer_mutex);
                             for (int i = 0; i < MAX_PEERS; i++) {
-                                if (peers[i].active) {
+                                if (peers[i].active && peers[i].awaiting_pong == 0) {
                                     uint16_t name_len = strlen(input);
                                     uint8_t *req = malloc(2 + name_len + 8);
                                     memcpy(req, &name_len, 2);
                                     memcpy(req + 2, input, name_len);
                                     uint64_t fsize64 = fsize;
                                     memcpy(req + 2 + name_len, &fsize64, 8);
-                                    send_msg(peers[i].sock, TYPE_FILE_REQ, req, 2 + name_len + 8);
-                                    free(req);
                                     
-                                    rewind(f);
-                                    uint8_t chunk[CHUNK_SIZE];
-                                    size_t n;
-                                    while ((n = fread(chunk, 1, CHUNK_SIZE, f)) > 0) {
-                                        send_msg(peers[i].sock, TYPE_FILE_DATA, chunk, n);
+                                    if (send_msg(peers[i].sock, TYPE_FILE_REQ, req, 2 + name_len + 8) == 0) {
+                                        rewind(f);
+                                        uint8_t chunk[CHUNK_SIZE];
+                                        size_t n;
+                                        while ((n = fread(chunk, 1, CHUNK_SIZE, f)) > 0) {
+                                            if (send_msg(peers[i].sock, TYPE_FILE_DATA, chunk, n) < 0) break;
+                                        }
+                                        send_msg(peers[i].sock, TYPE_FILE_END, NULL, 0);
+                                        sent++;
                                     }
-                                    send_msg(peers[i].sock, TYPE_FILE_END, NULL, 0);
+                                    free(req);
                                 }
                             }
                             pthread_mutex_unlock(&peer_mutex);
                             fclose(f);
-                            printf("✅ File broadcast inviato\n");
+                            printf("✅ Inviato a %d peer attivi\n", sent);
                         }
                     }
                 }
@@ -586,7 +747,6 @@ int main(void) {
         }
     }
     
-    // Cleanup
     running = 0;
     
     pthread_mutex_lock(&peer_mutex);
@@ -597,8 +757,6 @@ int main(void) {
         }
     }
     pthread_mutex_unlock(&peer_mutex);
-    
-    pthread_join(server_tid, NULL);
     
     printf("\n👋 Arrivederci!\n");
     return 0;
