@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <unistd.h> 
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -42,6 +43,7 @@ static void get_my_ip(char *ip_buf) {
 }
 
 static void *beacon_sender(void *arg) {
+    (void)arg;
     struct sockaddr_in broadcast_addr;
     memset(&broadcast_addr, 0, sizeof(broadcast_addr));
     broadcast_addr.sin_family = AF_INET;
@@ -70,6 +72,7 @@ static void handle_beacon(const char *msg) {
 }
 
 static void *beacon_listener(void *arg) {
+    (void)arg;
     char buf[128];
     struct sockaddr_in sender_addr;
     socklen_t addr_len = sizeof(sender_addr);

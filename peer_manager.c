@@ -54,7 +54,8 @@ void peer_add(const char *ip, unsigned short port) {
 
     peers = realloc(peers, (peer_count + 1) * sizeof(peer_t));
     peers[peer_count].sock = sock;
-    strncpy(peers[peer_count].ip, ip, 16);
+    strncpy(peers[peer_count].ip, ip, 15);
+    peers[peer_count].ip[15] = '\0';
     peers[peer_count].port = port;
     peer_count++;
 

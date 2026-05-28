@@ -72,7 +72,7 @@ void *tcp_server_thread(void *arg) {
         pthread_mutex_lock(&list_mutex);
         peers = realloc(peers, (peer_count+1)*sizeof(peer_t));
         peers[peer_count].sock = client;
-        strncpy(peers[peer_count].ip, ip, 16);
+        snprintf(peers[peer_count].ip, sizeof(peers[peer_count].ip), "%s", ip);
         peers[peer_count].port = port;
         peer_count++;
         pthread_mutex_unlock(&list_mutex);
