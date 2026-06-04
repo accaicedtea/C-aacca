@@ -1,9 +1,13 @@
 /*
- * p2p.c —test P2P Chat & File Transfer
- * TUI elegante, discovery automatico LAN, invio file grandi
+ * p2pchat.c — P2P Chat & File Transfer with GTK4 GUI (stable)
  *
- * Compile: gcc -o p2p p2p.c -lpthread -lm
- * Usage  : ./p2p [nome] [porta]
+ * Compile: make
+ * Usage  : ./p2pchat [name] [port] [ip]
+ *
+ * Features:
+ *   - Peer list, chat log, progress bar
+ *   - File send/receive with progress
+ *   - Modern GtkFileDialog for file selection
  */
 
 #define _GNU_SOURCE
@@ -25,64 +29,30 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
-#include <termios.h>
-#include <sys/ioctl.h>
 #include <math.h>
+#include <gtk/gtk.h>
 
-/* ═══════════════════════════════════════════════════════════
-   PROTOCOL
-   ═══════════════════════════════════════════════════════════ */
-#define MAGIC 0x50325031u /* "P2P1" */
-#define TYPE_HELLO 0x01   /* handshake: name\0 */
-#define TYPE_TEXT 0x02
-#define TYPE_FILE_HDR 0x03 /* filename\0 + uint64 size */
+/* ======================= PROTOCOL ======================= */
+#define MAGIC          0x50325031u
+#define TYPE_HELLO     0x01
+#define TYPE_TEXT      0x02
+#define TYPE_FILE_HDR  0x03
 #define TYPE_FILE_DATA 0x04
-#define TYPE_FILE_END 0x05
-#define TYPE_PING 0x10
-#define TYPE_PONG 0x11
-#define TYPE_QUIT 0xFF
+#define TYPE_FILE_END  0x05
+#define TYPE_PING      0x10
+#define TYPE_PONG      0x11
+#define TYPE_QUIT      0xFF
 
-#define CHUNK_SIZE 65536
-#define TCP_PORT_DEF 9100
-#define DISC_PORT 9101
-#define MAX_PEERS 32
-#define NAME_LEN 48
-#define HEARTBEAT_INT 5
-#define PEER_TIMEOUT 20
-#define LOG_LINES 200
+#define CHUNK_SIZE     65536
+#define TCP_PORT_DEF   9100
+#define DISC_PORT      9101
+#define MAX_PEERS      32
+#define NAME_LEN       48
+#define HEARTBEAT_INT  5
+#define PEER_TIMEOUT   20
 
-/* ═══════════════════════════════════════════════════════════
-   TUI ANSI
-   ═══════════════════════════════════════════════════════════ */
-#define C_RESET "\033[0m"
-#define C_BOLD "\033[1m"
-#define C_DIM "\033[2m"
-#define C_REV "\033[7m"
-#define C_BLACK "\033[30m"
-#define C_RED "\033[31m"
-#define C_GREEN "\033[32m"
-#define C_YELLOW "\033[33m"
-#define C_BLUE "\033[34m"
-#define C_MAGENTA "\033[35m"
-#define C_CYAN "\033[36m"
-#define C_WHITE "\033[37m"
-#define C_BBLUE "\033[94m"
-#define C_BCYAN "\033[96m"
-#define C_BGREEN "\033[92m"
-#define C_BRED "\033[91m"
-#define C_BYEL "\033[93m"
-#define C_BMAG "\033[95m"
-#define CLEAR "\033[2J\033[H"
-#define HIDE_CUR "\033[?25l"
-#define SHOW_CUR "\033[?25h"
-#define SAVE_CUR "\033[s"
-#define REST_CUR "\033[u"
-
-/* ═══════════════════════════════════════════════════════════
-   STRUCTS
-   ═══════════════════════════════════════════════════════════ */
-typedef struct
-{
+/* ======================= STRUCTS ======================= */
+typedef struct {
     int sock;
     char name[NAME_LEN];
     char ip[INET_ADDRSTRLEN];
@@ -90,693 +60,352 @@ typedef struct
     int active;
     time_t last_seen;
     int awaiting_pong;
-    uint64_t bytes_sent;
-    uint64_t bytes_recv;
+    uint64_t bytes_sent, bytes_recv;
     time_t connected_at;
 } Peer;
 
-typedef struct
-{
-    char text[256];
-    char color[16];
-    time_t ts;
-} LogEntry;
+typedef struct {
+    Peer peers[MAX_PEERS];
+    pthread_mutex_t peers_lock;
+    volatile int running;
+    char myname[NAME_LEN];
+    char myip[INET_ADDRSTRLEN];
+    int myport;
 
-/* ═══════════════════════════════════════════════════════════
-   GLOBALS
-   ═══════════════════════════════════════════════════════════ */
-static Peer peers[MAX_PEERS];
-static pthread_mutex_t peers_lock = PTHREAD_MUTEX_INITIALIZER;
-static volatile int g_run = 1;
-static char g_myname[NAME_LEN];
-static char g_myip[INET_ADDRSTRLEN];
-static int g_myport = TCP_PORT_DEF;
+    volatile uint64_t xfer_total;
+    volatile uint64_t xfer_done;
+    volatile int xfer_active;
+    char xfer_name[256];
+} AppData;
 
-/* log ring-buffer */
-static LogEntry g_log[LOG_LINES];
-static int g_log_head = 0;
-static int g_log_count = 0;
-static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static AppData g_data;
 
-/* transfer progress (for progress bar) */
-static volatile uint64_t g_xfer_total = 0;
-static volatile uint64_t g_xfer_done = 0;
-static volatile int g_xfer_active = 0;
-static char g_xfer_name[256];
-
-/* ═══════════════════════════════════════════════════════════
-   LOGGING
-   ═══════════════════════════════════════════════════════════ */
-static void log_add(const char *color, const char *fmt, ...)
-{
-    pthread_mutex_lock(&g_log_lock);
-    va_list ap;
-    va_start(ap, fmt);
-    LogEntry *e = &g_log[g_log_head % LOG_LINES];
-    vsnprintf(e->text, sizeof(e->text), fmt, ap);
-    va_end(ap);
-    strncpy(e->color, color, sizeof(e->color) - 1);
-    e->ts = time(NULL);
-    g_log_head++;
-    if (g_log_count < LOG_LINES)
-        g_log_count++;
-    pthread_mutex_unlock(&g_log_lock);
-}
-
-/* ═══════════════════════════════════════════════════════════
-   NET HELPERS
-   ═══════════════════════════════════════════════════════════ */
-static int send_all(int s, const void *buf, int len)
-{
-    const char *p = (const char *)buf;
+/* ======================= NET HELPERS ======================= */
+static int send_all(int s, const void *buf, int len) {
+    const char *p = buf;
     int sent = 0;
-    while (sent < len)
-    {
-        int n = (int)send(s, p + sent, (size_t)(len - sent), MSG_NOSIGNAL);
-        if (n <= 0)
-            return -1;
+    while (sent < len) {
+        int n = send(s, p + sent, len - sent, MSG_NOSIGNAL);
+        if (n <= 0) return -1;
         sent += n;
     }
     return 0;
 }
 
-static int recv_all(int s, void *buf, int len)
-{
-    char *p = (char *)buf;
+static int recv_all(int s, void *buf, int len) {
+    char *p = buf;
     int got = 0;
-    while (got < len)
-    {
-        int n = (int)recv(s, p + got, (size_t)(len - got), 0);
-        if (n <= 0)
-            return -1;
+    while (got < len) {
+        int n = recv(s, p + got, len - got, 0);
+        if (n <= 0) return -1;
         got += n;
     }
     return 0;
 }
 
-/* Wire format: [4 magic][1 type][4 len][len data] */
-static int proto_send(int s, uint8_t type, const void *payload, uint32_t len)
-{
+static int proto_send(int s, uint8_t type, const void *payload, uint32_t len) {
     uint8_t hdr[9];
-    uint32_t m = htonl(MAGIC);
-    uint32_t nl = htonl(len);
+    uint32_t m = htonl(MAGIC), nl = htonl(len);
     memcpy(hdr, &m, 4);
     hdr[4] = type;
     memcpy(hdr + 5, &nl, 4);
-    if (send_all(s, hdr, 9) < 0)
-        return -1;
+    if (send_all(s, hdr, 9) < 0) return -1;
     if (len > 0 && payload)
-    {
-        if (send_all(s, payload, (int)len) < 0)
-            return -1;
-    }
+        if (send_all(s, payload, len) < 0) return -1;
     return 0;
 }
 
-static int proto_recv(int s, uint8_t *type, uint8_t **payload, uint32_t *len)
-{
+static int proto_recv(int s, uint8_t *type, uint8_t **payload, uint32_t *len) {
     uint8_t hdr[9];
-    if (recv_all(s, hdr, 9) < 0)
-        return -1;
+    if (recv_all(s, hdr, 9) < 0) return -1;
     uint32_t m;
     memcpy(&m, hdr, 4);
-    if (ntohl(m) != MAGIC)
-        return -1;
+    if (ntohl(m) != MAGIC) return -1;
     *type = hdr[4];
     memcpy(len, hdr + 5, 4);
     *len = ntohl(*len);
-    if (*len > 0)
-    {
-        *payload = (uint8_t *)malloc(*len + 1);
-        if (!*payload)
-            return -1;
-        (*payload)[*len] = 0; /* null-terminate for text safety */
-        if (recv_all(s, *payload, (int)*len) < 0)
-        {
+    if (*len > 0) {
+        *payload = malloc(*len + 1);
+        if (!*payload) return -1;
+        (*payload)[*len] = 0;
+        if (recv_all(s, *payload, *len) < 0) {
             free(*payload);
-            *payload = NULL;
             return -1;
         }
-    }
-    else
-    {
+    } else {
         *payload = NULL;
     }
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   PEER MANAGEMENT
-   ═══════════════════════════════════════════════════════════ */
-static int peer_add(const char *name, const char *ip, int port, int sock)
-{
-    pthread_mutex_lock(&peers_lock);
-
-    /* update existing */
-    for (int i = 0; i < MAX_PEERS; i++)
-    {
-        if (peers[i].active &&
-            strcmp(peers[i].ip, ip) == 0 &&
-            peers[i].port == port)
-        {
-            /* reconnect */
-            close(peers[i].sock);
-            peers[i].sock = sock;
-            strncpy(peers[i].name, name, NAME_LEN - 1);
-            peers[i].last_seen = time(NULL);
-            peers[i].awaiting_pong = 0;
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BYEL, "⟳  %s ri-connesso (%s)", name, ip);
+/* ======================= PEER MANAGEMENT ======================= */
+static int peer_add(const char *name, const char *ip, int port, int sock) {
+    pthread_mutex_lock(&g_data.peers_lock);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (g_data.peers[i].active &&
+            !strcmp(g_data.peers[i].ip, ip) && g_data.peers[i].port == port) {
+            close(g_data.peers[i].sock);
+            g_data.peers[i].sock = sock;
+            strncpy(g_data.peers[i].name, name, NAME_LEN - 1);
+            g_data.peers[i].last_seen = time(NULL);
+            g_data.peers[i].awaiting_pong = 0;
+            pthread_mutex_unlock(&g_data.peers_lock);
             return i;
         }
     }
-
-    /* find free slot */
-    for (int i = 0; i < MAX_PEERS; i++)
-    {
-        if (!peers[i].active)
-        {
-            memset(&peers[i], 0, sizeof(peers[i]));
-            strncpy(peers[i].name, name, NAME_LEN - 1);
-            strncpy(peers[i].ip, ip, INET_ADDRSTRLEN - 1);
-            peers[i].port = port;
-            peers[i].sock = sock;
-            peers[i].active = 1;
-            peers[i].last_seen = time(NULL);
-            peers[i].connected_at = time(NULL);
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BGREEN, "✓  %s connesso  [%s:%d]", name, ip, port);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!g_data.peers[i].active) {
+            memset(&g_data.peers[i], 0, sizeof(Peer));
+            strncpy(g_data.peers[i].name, name, NAME_LEN - 1);
+            strncpy(g_data.peers[i].ip, ip, INET_ADDRSTRLEN - 1);
+            g_data.peers[i].port = port;
+            g_data.peers[i].sock = sock;
+            g_data.peers[i].active = 1;
+            g_data.peers[i].last_seen = time(NULL);
+            g_data.peers[i].connected_at = time(NULL);
+            pthread_mutex_unlock(&g_data.peers_lock);
             return i;
         }
     }
-
-    pthread_mutex_unlock(&peers_lock);
+    pthread_mutex_unlock(&g_data.peers_lock);
     close(sock);
     return -1;
 }
 
-static void peer_remove_by_sock(int sock)
-{
-    pthread_mutex_lock(&peers_lock);
-    for (int i = 0; i < MAX_PEERS; i++)
-    {
-        if (peers[i].active && peers[i].sock == sock)
-        {
-            log_add(C_BRED, "✗  %s disconnesso", peers[i].name);
+static void peer_remove_by_sock(int sock) {
+    pthread_mutex_lock(&g_data.peers_lock);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (g_data.peers[i].active && g_data.peers[i].sock == sock) {
             close(sock);
-            peers[i].active = 0;
+            g_data.peers[i].active = 0;
             break;
         }
     }
-    pthread_mutex_unlock(&peers_lock);
+    pthread_mutex_unlock(&g_data.peers_lock);
 }
 
-static int peer_count(void)
-{
-    int c = 0;
-    pthread_mutex_lock(&peers_lock);
-    for (int i = 0; i < MAX_PEERS; i++)
-        if (peers[i].active)
-            c++;
-    pthread_mutex_unlock(&peers_lock);
-    return c;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   HEARTBEAT THREAD
-   ═══════════════════════════════════════════════════════════ */
-static void *thread_heartbeat(void *arg)
-{
+/* ======================= HEARTBEAT ======================= */
+static void *thread_heartbeat(void *arg) {
     (void)arg;
-    while (g_run)
-    {
+    while (g_data.running) {
         sleep(HEARTBEAT_INT);
         time_t now = time(NULL);
-        pthread_mutex_lock(&peers_lock);
-        for (int i = 0; i < MAX_PEERS; i++)
-        {
-            if (!peers[i].active)
-                continue;
-            if (peers[i].awaiting_pong &&
-                (now - peers[i].last_seen) > PEER_TIMEOUT)
-            {
-                log_add(C_BRED, "⏱  %s timeout", peers[i].name);
-                close(peers[i].sock);
-                peers[i].active = 0;
+        pthread_mutex_lock(&g_data.peers_lock);
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (!g_data.peers[i].active) continue;
+            if (g_data.peers[i].awaiting_pong &&
+                (now - g_data.peers[i].last_seen) > PEER_TIMEOUT) {
+                close(g_data.peers[i].sock);
+                g_data.peers[i].active = 0;
                 continue;
             }
-            if (!peers[i].awaiting_pong)
-            {
-                if (proto_send(peers[i].sock, TYPE_PING, NULL, 0) < 0)
-                {
-                    close(peers[i].sock);
-                    peers[i].active = 0;
-                }
-                else
-                {
-                    peers[i].awaiting_pong = 1;
+            if (!g_data.peers[i].awaiting_pong) {
+                if (proto_send(g_data.peers[i].sock, TYPE_PING, NULL, 0) < 0) {
+                    close(g_data.peers[i].sock);
+                    g_data.peers[i].active = 0;
+                } else {
+                    g_data.peers[i].awaiting_pong = 1;
                 }
             }
         }
-        pthread_mutex_unlock(&peers_lock);
+        pthread_mutex_unlock(&g_data.peers_lock);
     }
     return NULL;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   TCP RECEIVER THREAD (one per connection)
-   ═══════════════════════════════════════════════════════════ */
-typedef struct
-{
-    int sock;
-    char ip[INET_ADDRSTRLEN];
-    int port;
-} ConnInfo;
-
-static void *thread_receiver(void *arg)
-{
-    ConnInfo ci = *(ConnInfo *)arg;
+/* ======================= MESSAGE HANDLER (with file receive) ======================= */
+static void *handle_peer_messages(void *arg) {
+    int s = *(int *)arg;
     free(arg);
-    int s = ci.sock;
 
-    /* --- HANDSHAKE: expect HELLO --- */
     uint8_t type;
     uint8_t *pay;
     uint32_t plen;
-    if (proto_recv(s, &type, &pay, &plen) < 0 || type != TYPE_HELLO)
-    {
-        free(pay);
-        close(s);
-        return NULL;
-    }
-    char remote_name[NAME_LEN];
-    strncpy(remote_name, (char *)pay, NAME_LEN - 1);
-    remote_name[NAME_LEN - 1] = 0;
-    free(pay);
+    int file_receiving = 0;
+    FILE *fp = NULL;
+    uint64_t fsize = 0, received = 0;
+    char safe_name[512] = {0};
 
-    /* send our HELLO back */
-    if (proto_send(s, TYPE_HELLO, g_myname, (uint32_t)strlen(g_myname)) < 0)
-    {
-        close(s);
-        return NULL;
-    }
+    while (g_data.running) {
+        if (proto_recv(s, &type, &pay, &plen) < 0) break;
 
-    int peer_idx = peer_add(remote_name, ci.ip, ci.port, s);
-    if (peer_idx < 0)
-    {
-        close(s);
-        return NULL;
-    }
+        /* if currently receiving a file, treat almost all messages inside sub-loop */
+        if (file_receiving) {
+            if (type == TYPE_FILE_DATA) {
+                if (fp && plen > 0) fwrite(pay, 1, plen, fp);
+                received += plen;
+                g_data.xfer_done = received;
+                free(pay);
+            } else if (type == TYPE_FILE_END) {
+                free(pay);
+                file_receiving = 0;
+                g_data.xfer_active = 0;
+                if (fp) { fclose(fp); fp = NULL; }
+                g_data.xfer_total = 0;
+            } else if (type == TYPE_PING) {
+                proto_send(s, TYPE_PONG, NULL, 0);
+                free(pay);
+            } else if (type == TYPE_PONG) {
+                pthread_mutex_lock(&g_data.peers_lock);
+                for (int i = 0; i < MAX_PEERS; i++)
+                    if (g_data.peers[i].active && g_data.peers[i].sock == s) {
+                        g_data.peers[i].last_seen = time(NULL);
+                        g_data.peers[i].awaiting_pong = 0;
+                        break;
+                    }
+                pthread_mutex_unlock(&g_data.peers_lock);
+                free(pay);
+            } else {
+                free(pay);
+            }
+            continue;
+        }
 
-    /* --- MESSAGE LOOP --- */
-    while (g_run)
-    {
-        if (proto_recv(s, &type, &pay, &plen) < 0)
-            break;
-
-        switch (type)
-        {
+        /* normal message handling */
+        switch (type) {
         case TYPE_PING:
             proto_send(s, TYPE_PONG, NULL, 0);
             free(pay);
             break;
-
         case TYPE_PONG:
-            pthread_mutex_lock(&peers_lock);
+            pthread_mutex_lock(&g_data.peers_lock);
             for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    peers[i].last_seen = time(NULL);
-                    peers[i].awaiting_pong = 0;
+                if (g_data.peers[i].active && g_data.peers[i].sock == s) {
+                    g_data.peers[i].last_seen = time(NULL);
+                    g_data.peers[i].awaiting_pong = 0;
                     break;
                 }
-            pthread_mutex_unlock(&peers_lock);
+            pthread_mutex_unlock(&g_data.peers_lock);
             free(pay);
             break;
-
         case TYPE_TEXT:
-        {
-            char sender[NAME_LEN] = "?";
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    strncpy(sender, peers[i].name, NAME_LEN - 1);
-                    peers[i].bytes_recv += plen;
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BCYAN, "💬 %-16s  %.*s", sender, (int)plen, (char *)pay);
             free(pay);
             break;
-        }
-
-        case TYPE_FILE_HDR:
-        {
-            /* payload: filename\0 + 8 bytes uint64 size (big-endian) */
-            if (!pay || plen < 9)
-            {
-                free(pay);
-                break;
-            }
-            char *fname = (char *)pay;
-            size_t fnlen = strlen(fname);
-            if (fnlen + 1 + 8 > plen)
-            {
-                free(pay);
-                break;
-            }
-            uint64_t fsize;
-            memcpy(&fsize, pay + fnlen + 1, 8);
-            fsize = /* ntohll */ (
-                ((uint64_t)ntohl((uint32_t)(fsize >> 32))) |
-                ((uint64_t)ntohl((uint32_t)(fsize & 0xFFFFFFFF)) << 32));
-
-            char sender[NAME_LEN] = "?";
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    strncpy(sender, peers[i].name, NAME_LEN - 1);
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BMAG, "↓  %s invia  %s  (%.1f MB)",
-                    sender, fname, (double)fsize / 1048576.0);
-            free(pay);
-            pay = NULL;
-
-            char *base = fname;
-           
-            (void)base;
-            log_add(C_BRED, "BUG-GUARD: dovrei rientrare nel recv file");
-            break;
-        }
-
-        /* We'll handle file receive in a dedicated sub-loop below */
-        case TYPE_FILE_END:
-            free(pay);
-            break;
-
-        case TYPE_QUIT:
-            free(pay);
-            goto disconnect;
-
-        default:
-            free(pay);
-            break;
-        }
-        continue;
-    disconnect:
-        break;
-    }
-
-    peer_remove_by_sock(s);
-    return NULL;
-}
-
-/*
- * Receiver v2 — proper file handling (replace thread_receiver above).
- * The goto-based sub-loop was too messy; clean rewrite below.
- */
-static void *thread_receiver_v2(void *arg)
-{
-    ConnInfo ci = *(ConnInfo *)arg;
-    free(arg);
-    int s = ci.sock;
-
-    /* ── HANDSHAKE ── */
-    {
-        uint8_t t;
-        uint8_t *p;
-        uint32_t l;
-        if (proto_recv(s, &t, &p, &l) < 0 || t != TYPE_HELLO)
-        {
-            free(p);
-            close(s);
-            return NULL;
-        }
-        char rname[NAME_LEN] = {0};
-        strncpy(rname, (char *)p, NAME_LEN - 1);
-        free(p);
-        if (proto_send(s, TYPE_HELLO, g_myname, (uint32_t)strlen(g_myname)) < 0)
-        {
-            close(s);
-            return NULL;
-        }
-        if (peer_add(rname, ci.ip, ci.port, s) < 0)
-        {
-            close(s);
-            return NULL;
-        }
-    }
-
-    /* ── MESSAGE LOOP ── */
-    for (;;)
-    {
-        uint8_t type;
-        uint8_t *pay;
-        uint32_t plen;
-        if (proto_recv(s, &type, &pay, &plen) < 0)
-            break;
-
-        if (type == TYPE_PING)
-        {
-            proto_send(s, TYPE_PONG, NULL, 0);
-            free(pay);
-        }
-        else if (type == TYPE_PONG)
-        {
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    peers[i].last_seen = time(NULL);
-                    peers[i].awaiting_pong = 0;
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            free(pay);
-        }
-        else if (type == TYPE_TEXT)
-        {
-            char sender[NAME_LEN] = "?";
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    strncpy(sender, peers[i].name, NAME_LEN - 1);
-                    peers[i].bytes_recv += plen;
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BCYAN, "💬 %-14s  %.*s", sender, (int)plen, (char *)pay);
-            free(pay);
-        }
-        else if (type == TYPE_FILE_HDR)
-        {
-            /* payload layout: <filename>\0<8 bytes BE uint64 size> */
-            if (!pay || plen < 2)
-            {
-                free(pay);
-                continue;
-            }
-
-            /* safely extract filename */
+        case TYPE_FILE_HDR: {
+            if (!pay || plen < 2) { free(pay); continue; }
             size_t fnlen = strnlen((char *)pay, plen);
-            if (fnlen + 1 + 8 > plen)
-            {
-                free(pay);
-                continue;
-            }
+            if (fnlen + 1 + 8 > plen) { free(pay); continue; }
 
             char fname[512];
             strncpy(fname, (char *)pay, sizeof(fname) - 1);
             fname[sizeof(fname) - 1] = 0;
 
-            uint64_t fsize_net, fsize;
-            memcpy(&fsize_net, pay + fnlen + 1, 8);
-            /* manual ntohll */
-            uint32_t hi = ntohl((uint32_t)(fsize_net >> 32));
-            uint32_t lo = ntohl((uint32_t)(fsize_net & 0xFFFFFFFFu));
-            fsize = ((uint64_t)lo << 32) | (uint64_t)hi;
+            uint32_t hi_net, lo_net;
+            memcpy(&hi_net, pay + fnlen + 1, 4);
+            memcpy(&lo_net, pay + fnlen + 5, 4);
+            fsize = ((uint64_t)ntohl(hi_net) << 32) | ntohl(lo_net);
             free(pay);
 
-            /* strip directory component from received filename */
             char *base = strrchr(fname, '/');
-            if (!base)
-                base = strrchr(fname, '\\');
-            const char *safe_name = base ? base + 1 : fname;
+            if (!base) base = strrchr(fname, '\\');
+            snprintf(safe_name, sizeof(safe_name), "%s", base ? base + 1 : fname);
 
-            char sender[NAME_LEN] = "?";
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    strncpy(sender, peers[i].name, NAME_LEN - 1);
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
+            g_data.xfer_total = fsize;
+            g_data.xfer_done = 0;
+            g_data.xfer_active = 1;
+            snprintf(g_data.xfer_name, sizeof(g_data.xfer_name), "%s", safe_name);
 
-            log_add(C_BMAG, "↓  %s → %s  (%.2f MB)",
-                    sender, safe_name, (double)fsize / 1048576.0);
-
-            /* show progress */
-            g_xfer_total = fsize;
-            g_xfer_done = 0;
-            g_xfer_active = 1;
-            strncpy(g_xfer_name, safe_name, sizeof(g_xfer_name) - 1);
-
-            FILE *fp = fopen(safe_name, "wb");
-            if (!fp)
-                log_add(C_BRED, "  impossibile creare %s: %s", safe_name, strerror(errno));
-
-            uint64_t received = 0;
-            int file_ok = 1;
-            for (;;)
-            {
-                uint8_t t2;
-                uint8_t *p2;
-                uint32_t l2;
-                if (proto_recv(s, &t2, &p2, &l2) < 0)
-                {
-                    file_ok = 0;
-                    free(p2);
-                    break;
-                }
-                if (t2 == TYPE_FILE_DATA)
-                {
-                    if (fp)
-                        fwrite(p2, 1, l2, fp);
-                    received += l2;
-                    g_xfer_done = received;
-                    free(p2);
-                }
-                else if (t2 == TYPE_FILE_END)
-                {
-                    free(p2);
-                    break;
-                }
-                else
-                {
-                    free(p2);
-                }
+            fp = fopen(safe_name, "wb");
+            if (!fp) {
+                g_data.xfer_active = 0;
+                g_data.xfer_total = 0;
             }
-            g_xfer_active = 0;
-            if (fp)
-                fclose(fp);
-
-            if (file_ok)
-                log_add(C_BGREEN, "  ✓ %s  %.2f MB ricevuto",
-                        safe_name, (double)received / 1048576.0);
-            else
-                log_add(C_BRED, "  ✗ %s  ricezione interrotta", safe_name);
+            received = 0;
+            file_receiving = 1;
+            break;
         }
-        else if (type == TYPE_QUIT)
-        {
+        case TYPE_QUIT:
+            free(pay);
+            goto disconnect;
+        default:
             free(pay);
             break;
         }
-        else
-        {
-            free(pay);
-        }
     }
-
+disconnect:
+    if (fp) fclose(fp);
     peer_remove_by_sock(s);
     return NULL;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   TCP SERVER THREAD
-   ═══════════════════════════════════════════════════════════ */
-static void *thread_tcp_server(void *arg)
-{
+/* ======================= TCP SERVER ======================= */
+static void *thread_tcp_server(void *arg) {
     (void)arg;
     int ls = socket(AF_INET, SOCK_STREAM, 0);
-    if (ls < 0)
-    {
-        log_add(C_BRED, "tcp_server socket: %s", strerror(errno));
-        return NULL;
-    }
-
+    if (ls < 0) return NULL;
     int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(ls, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)g_myport);
+    addr.sin_port = htons(g_data.myport);
     addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        log_add(C_BRED, "tcp_server bind: %s", strerror(errno));
+    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(ls);
         return NULL;
     }
     listen(ls, 16);
 
-    while (g_run)
-    {
+    while (g_data.running) {
         struct sockaddr_in ca;
         socklen_t cl = sizeof(ca);
         int c = accept(ls, (struct sockaddr *)&ca, &cl);
-        if (c < 0)
-        {
-            if (g_run)
-                usleep(50000);
-            continue;
-        }
+        if (c < 0) { if (g_data.running) usleep(50000); continue; }
         int flag = 1;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-        ConnInfo *ci = (ConnInfo *)malloc(sizeof(ConnInfo));
-        ci->sock = c;
-        ci->port = g_myport;
-        inet_ntop(AF_INET, &ca.sin_addr, ci->ip, sizeof(ci->ip));
+        uint8_t mtype; uint8_t *mpayload; uint32_t mlen;
+        if (proto_recv(c, &mtype, &mpayload, &mlen) < 0 || mtype != TYPE_HELLO) {
+            free(mpayload); close(c); continue;
+        }
+        char rname[NAME_LEN] = {0};
+        strncpy(rname, (char *)mpayload, NAME_LEN - 1);
+        free(mpayload);
+        if (proto_send(c, TYPE_HELLO, g_data.myname, strlen(g_data.myname)) < 0) {
+            close(c); continue;
+        }
 
-        pthread_t t;
-        pthread_create(&t, NULL, thread_receiver_v2, ci);
-        pthread_detach(t);
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
+        if (peer_add(rname, ip, g_data.myport, c) < 0) {
+            close(c); continue;
+        }
+
+        int *psock = malloc(sizeof(int));
+        *psock = c;
+        pthread_t thr;
+        pthread_create(&thr, NULL, handle_peer_messages, psock);
+        pthread_detach(thr);
     }
     close(ls);
     return NULL;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   DISCOVERY — responder (answers UDP broadcasts)
-   ═══════════════════════════════════════════════════════════ */
-static void *thread_disc_responder(void *arg)
-{
+/* ======================= DISCOVERY ======================= */
+static void *thread_disc_responder(void *arg) {
     (void)arg;
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
-        return NULL;
+    if (s < 0) return NULL;
     int one = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons(DISC_PORT);
     a.sin_addr.s_addr = INADDR_ANY;
     bind(s, (struct sockaddr *)&a, sizeof(a));
-
     char buf[256];
     struct sockaddr_in from;
     socklen_t fl;
-    while (g_run)
-    {
+    while (g_data.running) {
         fl = sizeof(from);
-        int n = (int)recvfrom(s, buf, (int)sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
-        if (n <= 0)
-            continue;
+        int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
+        if (n <= 0) continue;
         buf[n] = 0;
-        if (strncmp(buf, "P2PDISC|", 8) == 0)
-        {
+        if (strncmp(buf, "P2PDISC|", 8) == 0) {
             char resp[256];
-            snprintf(resp, sizeof(resp), "P2PHERE|%s|%d", g_myname, g_myport);
+            snprintf(resp, sizeof(resp), "P2PHERE|%s|%d", g_data.myname, g_data.myport);
             sendto(s, resp, strlen(resp), 0, (struct sockaddr *)&from, sizeof(from));
         }
     }
@@ -784,263 +413,16 @@ static void *thread_disc_responder(void *arg)
     return NULL;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   DISCOVERY — seeker (broadcasts + connects to found peers)
-   ═══════════════════════════════════════════════════════════ */
-static void do_connect(const char *ip, int port)
-{
-    /* skip self */
-    if (strcmp(ip, g_myip) == 0 && port == g_myport)
-        return;
+static void do_connect(const char *ip, int port);
 
-    /* skip already connected */
-    pthread_mutex_lock(&peers_lock);
-    for (int i = 0; i < MAX_PEERS; i++)
-    {
-        if (peers[i].active &&
-            strcmp(peers[i].ip, ip) == 0 &&
-            peers[i].port == port)
-        {
-            pthread_mutex_unlock(&peers_lock);
-            return;
-        }
-    }
-    pthread_mutex_unlock(&peers_lock);
-
-    int ts = socket(AF_INET, SOCK_STREAM, 0);
-    if (ts < 0)
-        return;
-
-    /* non-blocking connect with 2s timeout */
-    int flags = fcntl(ts, F_GETFL, 0);
-    fcntl(ts, F_SETFL, flags | O_NONBLOCK);
-
-    struct sockaddr_in ta = {0};
-    ta.sin_family = AF_INET;
-    ta.sin_port = htons((uint16_t)port);
-    inet_pton(AF_INET, ip, &ta.sin_addr);
-
-    connect(ts, (struct sockaddr *)&ta, sizeof(ta));
-
-    struct timeval tv = {2, 0};
-    fd_set wset;
-    FD_ZERO(&wset);
-    FD_SET(ts, &wset);
-    if (select(ts + 1, NULL, &wset, NULL, &tv) <= 0)
-    {
-        close(ts);
-        return;
-    }
-    int err = 0;
-    socklen_t el = sizeof(err);
-    getsockopt(ts, SOL_SOCKET, SO_ERROR, &err, &el);
-    if (err)
-    {
-        close(ts);
-        return;
-    }
-
-    fcntl(ts, F_SETFL, flags); /* restore blocking */
-    int one = 1;
-    setsockopt(ts, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-    /* ── HANDSHAKE: send HELLO, receive HELLO ── */
-    if (proto_send(ts, TYPE_HELLO, g_myname, (uint32_t)strlen(g_myname)) < 0)
-    {
-        close(ts);
-        return;
-    }
-    uint8_t t;
-    uint8_t *p;
-    uint32_t l;
-    if (proto_recv(ts, &t, &p, &l) < 0 || t != TYPE_HELLO)
-    {
-        free(p);
-        close(ts);
-        return;
-    }
-    char rname[NAME_LEN] = {0};
-    strncpy(rname, (char *)p, NAME_LEN - 1);
-    free(p);
-
-    int idx = peer_add(rname, ip, port, ts);
-    if (idx < 0)
-        return;
-
-    /* spawn receiver for ongoing messages */
-    ConnInfo *ci = (ConnInfo *)malloc(sizeof(ConnInfo));
-    ci->sock = ts;
-    ci->port = port;
-    strncpy(ci->ip, ip, sizeof(ci->ip) - 1);
-
-    free(ci);
-
-    /* Spawn a mini receive loop thread */
-    int *sp = (int *)malloc(sizeof(int));
-    *sp = ts;
-
-    /* define inline thread */
-    extern void *outgoing_recv_loop(void *arg);
-    pthread_t rt;
-    pthread_create(&rt, NULL, outgoing_recv_loop, sp);
-    pthread_detach(rt);
-}
-
-/* Message-receive loop for outgoing connections (handshake already done) */
-void *outgoing_recv_loop(void *arg)
-{
-    int s = *(int *)arg;
-    free(arg);
-
-    for (;;)
-    {
-        uint8_t type;
-        uint8_t *pay;
-        uint32_t plen;
-        if (proto_recv(s, &type, &pay, &plen) < 0)
-            break;
-
-        if (type == TYPE_PING)
-        {
-            proto_send(s, TYPE_PONG, NULL, 0);
-            free(pay);
-        }
-        else if (type == TYPE_PONG)
-        {
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    peers[i].last_seen = time(NULL);
-                    peers[i].awaiting_pong = 0;
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            free(pay);
-        }
-        else if (type == TYPE_TEXT)
-        {
-            char sender[NAME_LEN] = "?";
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    strncpy(sender, peers[i].name, NAME_LEN - 1);
-                    peers[i].bytes_recv += plen;
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BCYAN, "💬 %-14s  %.*s", sender, (int)plen, (char *)pay);
-            free(pay);
-        }
-        else if (type == TYPE_FILE_HDR)
-        {
-            if (!pay || plen < 2)
-            {
-                free(pay);
-                continue;
-            }
-            size_t fnlen = strnlen((char *)pay, plen);
-            if (fnlen + 1 + 8 > plen)
-            {
-                free(pay);
-                continue;
-            }
-            char fname[512];
-            strncpy(fname, (char *)pay, sizeof(fname) - 1);
-            fname[sizeof(fname) - 1] = 0;
-            uint64_t fsize_net;
-            memcpy(&fsize_net, pay + fnlen + 1, 8);
-            uint32_t hi = ntohl((uint32_t)(fsize_net >> 32));
-            uint32_t lo = ntohl((uint32_t)(fsize_net & 0xFFFFFFFFu));
-            uint64_t fsize = ((uint64_t)lo << 32) | (uint64_t)hi;
-            free(pay);
-
-            char *base = strrchr(fname, '/');
-            if (!base)
-                base = strrchr(fname, '\\');
-            const char *safe_name = base ? base + 1 : fname;
-
-            char sender[NAME_LEN] = "?";
-            pthread_mutex_lock(&peers_lock);
-            for (int i = 0; i < MAX_PEERS; i++)
-                if (peers[i].active && peers[i].sock == s)
-                {
-                    strncpy(sender, peers[i].name, NAME_LEN - 1);
-                    break;
-                }
-            pthread_mutex_unlock(&peers_lock);
-            log_add(C_BMAG, "↓  %s → %s  (%.2f MB)", sender, safe_name, (double)fsize / 1048576.0);
-
-            g_xfer_total = fsize;
-            g_xfer_done = 0;
-            g_xfer_active = 1;
-            strncpy(g_xfer_name, safe_name, sizeof(g_xfer_name) - 1);
-
-            FILE *fp = fopen(safe_name, "wb");
-            if (!fp)
-                log_add(C_BRED, "  cannot create %s: %s", safe_name, strerror(errno));
-
-            uint64_t received = 0;
-            for (;;)
-            {
-                uint8_t t2;
-                uint8_t *p2;
-                uint32_t l2;
-                if (proto_recv(s, &t2, &p2, &l2) < 0)
-                {
-                    free(p2);
-                    break;
-                }
-                if (t2 == TYPE_FILE_DATA)
-                {
-                    if (fp)
-                        fwrite(p2, 1, l2, fp);
-                    received += l2;
-                    g_xfer_done = received;
-                    free(p2);
-                }
-                else if (t2 == TYPE_FILE_END)
-                {
-                    free(p2);
-                    break;
-                }
-                else
-                {
-                    free(p2);
-                }
-            }
-            g_xfer_active = 0;
-            if (fp)
-                fclose(fp);
-            log_add(C_BGREEN, "  ✓ %s  %.2f MB", safe_name, (double)received / 1048576.0);
-        }
-        else if (type == TYPE_QUIT)
-        {
-            free(pay);
-            break;
-        }
-        else
-        {
-            free(pay);
-        }
-    }
-
-    peer_remove_by_sock(s);
-    return NULL;
-}
-
-static void *thread_disc_seeker(void *arg)
-{
+static void *thread_disc_seeker(void *arg) {
     (void)arg;
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
-        return NULL;
+    if (s < 0) return NULL;
     int one = 1;
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
     struct timeval tv = {1, 0};
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     struct sockaddr_in bcast = {0};
     bcast.sin_family = AF_INET;
     bcast.sin_port = htons(DISC_PORT);
@@ -1049,30 +431,21 @@ static void *thread_disc_seeker(void *arg)
     char buf[256];
     struct sockaddr_in from;
     socklen_t fl;
-
-    while (g_run)
-    {
+    while (g_data.running) {
         char disc[64];
-        snprintf(disc, sizeof(disc), "P2PDISC|%s|%d", g_myname, g_myport);
+        snprintf(disc, sizeof(disc), "P2PDISC|%s|%d", g_data.myname, g_data.myport);
         sendto(s, disc, strlen(disc), 0, (struct sockaddr *)&bcast, sizeof(bcast));
 
         time_t deadline = time(NULL) + 2;
-        while (g_run && time(NULL) < deadline)
-        {
+        while (g_data.running && time(NULL) < deadline) {
             fl = sizeof(from);
-            int n = (int)recvfrom(s, buf, (int)sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
-            if (n <= 0)
-                continue;
+            int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
+            if (n <= 0) continue;
             buf[n] = 0;
-
-            char rname[NAME_LEN];
-            int rport;
-            if (sscanf(buf, "P2PHERE|%47[^|]|%d", rname, &rport) != 2)
-                continue;
-
+            char rname[NAME_LEN]; int rport;
+            if (sscanf(buf, "P2PHERE|%47[^|]|%d", rname, &rport) != 2) continue;
             char rip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &from.sin_addr, rip, sizeof(rip));
-            (void)rname; /* name learned via handshake */
             do_connect(rip, rport);
         }
         sleep(4);
@@ -1081,643 +454,465 @@ static void *thread_disc_seeker(void *arg)
     return NULL;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   SEND HELPERS
-   ═══════════════════════════════════════════════════════════ */
-static int send_text(int sock, const char *msg)
-{
-    return proto_send(sock, TYPE_TEXT, msg, (uint32_t)strlen(msg));
+static void do_connect(const char *ip, int port) {
+    if (!strcmp(ip, g_data.myip) && port == g_data.myport) return;
+
+    pthread_mutex_lock(&g_data.peers_lock);
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (g_data.peers[i].active &&
+            !strcmp(g_data.peers[i].ip, ip) && g_data.peers[i].port == port) {
+            pthread_mutex_unlock(&g_data.peers_lock);
+            return;
+        }
+    pthread_mutex_unlock(&g_data.peers_lock);
+
+    int ts = socket(AF_INET, SOCK_STREAM, 0);
+    if (ts < 0) return;
+
+    int flags = fcntl(ts, F_GETFL, 0);
+    fcntl(ts, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in ta = {0};
+    ta.sin_family = AF_INET;
+    ta.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &ta.sin_addr);
+    connect(ts, (struct sockaddr *)&ta, sizeof(ta));
+
+    struct timeval tv = {2, 0};
+    fd_set wset; FD_ZERO(&wset); FD_SET(ts, &wset);
+    if (select(ts + 1, NULL, &wset, NULL, &tv) <= 0) { close(ts); return; }
+    int err = 0; socklen_t el = sizeof(err);
+    getsockopt(ts, SOL_SOCKET, SO_ERROR, &err, &el);
+    if (err) { close(ts); return; }
+
+    fcntl(ts, F_SETFL, flags);
+    int one = 1;
+    setsockopt(ts, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    if (proto_send(ts, TYPE_HELLO, g_data.myname, strlen(g_data.myname)) < 0) { close(ts); return; }
+    uint8_t mtype; uint8_t *mpayload; uint32_t mlen;
+    if (proto_recv(ts, &mtype, &mpayload, &mlen) < 0 || mtype != TYPE_HELLO) {
+        free(mpayload); close(ts); return;
+    }
+    char rname[NAME_LEN] = {0};
+    strncpy(rname, (char *)mpayload, NAME_LEN - 1);
+    free(mpayload);
+
+    if (peer_add(rname, ip, port, ts) < 0) { close(ts); return; }
+
+    int *psock = malloc(sizeof(int));
+    *psock = ts;
+    pthread_t rt;
+    pthread_create(&rt, NULL, handle_peer_messages, psock);
+    pthread_detach(rt);
 }
 
-static int send_file(int sock, const char *path)
-{
-    struct stat st;
-    if (stat(path, &st) < 0)
-        return -1;
-    uint64_t fsize = (uint64_t)st.st_size;
+/* ======================= SEND HELPERS ======================= */
+static int send_text(int sock, const char *msg) {
+    return proto_send(sock, TYPE_TEXT, msg, strlen(msg));
+}
 
-    /* build HDR payload */
+static int send_file(int sock, const char *path) {
+    struct stat st;
+    if (stat(path, &st) < 0) return -1;
+    uint64_t fsize = st.st_size;
+
     size_t fnlen = strlen(path);
     size_t hlen = fnlen + 1 + 8;
-    uint8_t *hdr = (uint8_t *)malloc(hlen);
-    if (!hdr)
-        return -1;
+    uint8_t *hdr = malloc(hlen);
+    if (!hdr) return -1;
     memcpy(hdr, path, fnlen + 1);
 
-    /* htonll */
-    uint64_t fsize_net;
     uint32_t hi = htonl((uint32_t)(fsize >> 32));
-    uint32_t lo = htonl((uint32_t)(fsize & 0xFFFFFFFFu));
-    memcpy(&fsize_net, &lo, 4);
-    memcpy((char *)&fsize_net + 4, &hi, 4);
-    memcpy(hdr + fnlen + 1, &fsize_net, 8);
+    uint32_t lo = htonl((uint32_t)(fsize & 0xFFFFFFFF));
+    memcpy(hdr + fnlen + 1, &hi, 4);
+    memcpy(hdr + fnlen + 5, &lo, 4);
 
-    if (proto_send(sock, TYPE_FILE_HDR, hdr, (uint32_t)hlen) < 0)
-    {
-        free(hdr);
-        return -1;
-    }
+    if (proto_send(sock, TYPE_FILE_HDR, hdr, hlen) < 0) { free(hdr); return -1; }
     free(hdr);
 
     FILE *fp = fopen(path, "rb");
-    if (!fp)
-        return -1;
+    if (!fp) return -1;
 
-    g_xfer_total = fsize;
-    g_xfer_done = 0;
-    g_xfer_active = 1;
-    strncpy(g_xfer_name, path, sizeof(g_xfer_name) - 1);
+    g_data.xfer_total = fsize;
+    g_data.xfer_done = 0;
+    g_data.xfer_active = 1;
+    strncpy(g_data.xfer_name, path, sizeof(g_data.xfer_name) - 1);
 
-    uint8_t *chunk = (uint8_t *)malloc(CHUNK_SIZE);
-    size_t n;
-    int err = 0;
-    while ((n = fread(chunk, 1, CHUNK_SIZE, fp)) > 0)
-    {
-        if (proto_send(sock, TYPE_FILE_DATA, chunk, (uint32_t)n) < 0)
-        {
-            err = 1;
-            break;
-        }
-        g_xfer_done += n;
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    size_t n; int err = 0;
+    while ((n = fread(chunk, 1, CHUNK_SIZE, fp)) > 0) {
+        if (proto_send(sock, TYPE_FILE_DATA, chunk, n) < 0) { err = 1; break; }
+        g_data.xfer_done += n;
     }
     free(chunk);
     fclose(fp);
-
-    if (!err)
-        proto_send(sock, TYPE_FILE_END, NULL, 0);
-    g_xfer_active = 0;
+    if (!err) proto_send(sock, TYPE_FILE_END, NULL, 0);
+    g_data.xfer_active = 0;
     return err ? -1 : 0;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   TUI
-   ═══════════════════════════════════════════════════════════ */
-static int term_w = 80;
-static int term_h = 24;
+/* ======================= GTK GUI ======================= */
+typedef struct {
+    GtkWidget *window;
+    GtkWidget *label_info;
+    GtkWidget *listbox_peers;
+    GtkWidget *textview_log;
+    GtkTextBuffer *log_buffer;
+    GtkWidget *entry_msg;
+    GtkWidget *progress_bar;
+} GuiWidgets;
 
-static void tui_size(void)
-{
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
-    {
-        term_w = ws.ws_col;
-        term_h = ws.ws_row;
+static GuiWidgets g_gui;
+
+static void log_to_gui(const char *line) {
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(g_gui.log_buffer, &end);
+    gtk_text_buffer_insert(g_gui.log_buffer, &end, line, -1);
+    gtk_text_buffer_insert(g_gui.log_buffer, &end, "\n", -1);
+    GtkTextMark *mark = gtk_text_buffer_create_mark(g_gui.log_buffer, NULL, &end, FALSE);
+    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(g_gui.textview_log), mark, 0.0, TRUE, 0.0, 0.0);
+}
+
+static gboolean update_peer_list_cb(gpointer data) {
+    (void)data;
+    GtkListBox *listbox = GTK_LIST_BOX(g_gui.listbox_peers);
+    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(listbox));
+    while (child) {
+        GtkWidget *next = gtk_widget_get_next_sibling(child);
+        gtk_list_box_remove(listbox, child);
+        child = next;
     }
+
+    pthread_mutex_lock(&g_data.peers_lock);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (g_data.peers[i].active) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%s (%s)", g_data.peers[i].name, g_data.peers[i].ip);
+            GtkWidget *label = gtk_label_new(buf);
+            gtk_list_box_append(listbox, label);
+        }
+    }
+    pthread_mutex_unlock(&g_data.peers_lock);
+    return G_SOURCE_REMOVE;
 }
 
-static void tui_hline(char ch, int w)
-{
-    for (int i = 0; i < w; i++)
-        putchar(ch);
+static gboolean update_progress_cb(gpointer data) {
+    (void)data;
+    if (g_data.xfer_active && g_data.xfer_total > 0) {
+        double fraction = (double)g_data.xfer_done / g_data.xfer_total;
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(g_gui.progress_bar), fraction);
+        char text[64];
+        snprintf(text, sizeof(text), "%.0f%%", fraction * 100.0);
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(g_gui.progress_bar), text);
+        gtk_widget_set_visible(g_gui.progress_bar, TRUE);
+    } else {
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(g_gui.progress_bar), 0.0);
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(g_gui.progress_bar), "");
+        gtk_widget_set_visible(g_gui.progress_bar, FALSE);
+    }
+    return G_SOURCE_REMOVE;
 }
 
-static void tui_goto(int row, int col)
-{
-    printf("\033[%d;%dH", row, col);
+static gboolean periodic_update(gpointer data) {
+    (void)data;
+    g_idle_add(update_peer_list_cb, NULL);
+    g_idle_add(update_progress_cb, NULL);
+    return G_SOURCE_CONTINUE;
 }
 
-/* format bytes nicely */
-static void fmt_bytes(char *out, size_t outsz, uint64_t b)
-{
-    if (b < 1024)
-        snprintf(out, outsz, "%llu B", (unsigned long long)b);
-    else if (b < 1024 * 1024)
-        snprintf(out, outsz, "%.1f KB", (double)b / 1024.0);
-    else if (b < 1024 * 1024 * 1024)
-        snprintf(out, outsz, "%.1f MB", (double)b / 1048576.0);
-    else
-        snprintf(out, outsz, "%.2f GB", (double)b / 1073741824.0);
+static int get_selected_peer_socket(void) {
+    GtkListBoxRow *row = gtk_list_box_get_selected_row(GTK_LIST_BOX(g_gui.listbox_peers));
+    if (!row) return -1;
+    int idx = gtk_list_box_row_get_index(row);
+    pthread_mutex_lock(&g_data.peers_lock);
+    int sock = -1, cnt = 0;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (g_data.peers[i].active) {
+            if (cnt == idx) { sock = g_data.peers[i].sock; break; }
+            cnt++;
+        }
+    }
+    pthread_mutex_unlock(&g_data.peers_lock);
+    return sock;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   DRAW
-   ═══════════════════════════════════════════════════════════ */
-static void draw_screen(int log_offset, int menu_visible)
-{
-    tui_size();
-    tui_goto(1, 1);
+static void on_send_clicked(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    const char *msg = gtk_editable_get_text(GTK_EDITABLE(g_gui.entry_msg));
+    if (!msg || strlen(msg) == 0) return;
+    int sock = get_selected_peer_socket();
+    if (sock < 0) {
+        log_to_gui("No peer selected.");
+        return;
+    }
+    if (send_text(sock, msg) == 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Me: %s", msg);
+        log_to_gui(buf);
+    } else {
+        log_to_gui("Failed to send message.");
+    }
+    gtk_editable_set_text(GTK_EDITABLE(g_gui.entry_msg), "");
+}
 
-    int W = term_w;
-
-    /* ── HEADER ── */
-    printf("%s%s", C_BLUE C_BOLD, C_REV);
-    printf(" ⬡  P2P  MESH  CHAT  &  FILE  TRANSFER ");
-    int hpad = W - 39;
-    for (int i = 0; i < hpad; i++)
-        putchar(' ');
-    printf("%s\n", C_RESET);
-
-    /* ── STATUS BAR ── */
-    int pc = peer_count();
-    printf("%s╔", C_CYAN);
-    tui_hline('=', W - 2);
-    printf("╗%s\n", C_RESET);
-
-    printf("%s║%s", C_CYAN, C_RESET);
-    printf("  %s●%s %s  │  IP: %s%-16s%s│  Porta: %s%-6d%s│  Peer: %s%s%d%s%s  ",
-           C_BGREEN, C_RESET, g_myname,
-           C_BYEL, g_myip, C_RESET,
-           C_BYEL, g_myport, C_RESET,
-           pc > 0 ? C_BGREEN : C_BRED,
-           pc > 0 ? "" : "",
-           pc, C_RESET, "");
-    /* pad to W-2 */
-    printf("%s║%s\n", C_CYAN, C_RESET);
-
-    printf("%s╠", C_CYAN);
-    tui_hline('=', W - 2);
-    printf("╣%s\n", C_RESET);
-
-    /* ── PEER LIST ── */
-    int peer_cols = (W >= 100) ? 4 : (W >= 70 ? 3 : 2);
-    int col_w = (W - 2) / peer_cols;
-
-    printf("%s║%s%s  PEERS  %s", C_CYAN, C_RESET, C_DIM, C_RESET);
-    for (int i = 0; i < W - 2 - 9; i++)
-        putchar(' ');
-    printf("%s║%s\n", C_CYAN, C_RESET);
-
-    pthread_mutex_lock(&peers_lock);
-    int shown = 0, cidx = 0;
-    printf("%s║%s  ", C_CYAN, C_RESET);
+static void on_broadcast_clicked(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    const char *msg = gtk_editable_get_text(GTK_EDITABLE(g_gui.entry_msg));
+    if (!msg || strlen(msg) == 0) return;
+    pthread_mutex_lock(&g_data.peers_lock);
     for (int i = 0; i < MAX_PEERS; i++)
-    {
-        if (!peers[i].active)
-            continue;
-        char uptime[24];
-        time_t up = time(NULL) - peers[i].connected_at;
-        snprintf(uptime, sizeof(uptime), "%02d:%02d", (int)(up / 60), (int)(up % 60));
-        char bs[16], br[16];
-        fmt_bytes(bs, sizeof(bs), peers[i].bytes_sent);
-        fmt_bytes(br, sizeof(br), peers[i].bytes_recv);
-        int cw = col_w - 3;
-        printf("%s[%d]%s %-*.*s %s↑%s%-7s %s↓%s%-7s  ",
-               C_BGREEN, shown, C_RESET,
-               (cw > 16 ? 16 : cw), (cw > 16 ? 16 : cw),
-               peers[i].name,
-               C_BYEL, C_RESET, bs,
-               C_BMAG, C_RESET, br);
-        shown++;
-        cidx++;
-        if (cidx >= peer_cols)
-        {
-            /* pad to end of row */
-            printf("%s║%s\n%s║%s  ", C_CYAN, C_RESET, C_CYAN, C_RESET);
-            cidx = 0;
-        }
-    }
-    if (shown == 0)
-        printf("%s  nessun peer connesso — in ascolto...%s", C_DIM, C_RESET);
-    pthread_mutex_unlock(&peers_lock);
-
-    /* pad remaining columns */
-    int remaining = (W - 2) - (cidx * col_w) - 2;
-    for (int i = 0; i < remaining && i < W; i++)
-        putchar(' ');
-    printf("%s║%s\n", C_CYAN, C_RESET);
-
-    printf("%s╠", C_CYAN);
-    tui_hline('=', W - 2);
-    printf("╣%s\n", C_RESET);
-
-    /* ── TRANSFER PROGRESS ── */
-    if (g_xfer_active && g_xfer_total > 0)
-    {
-        double pct = (double)g_xfer_done / (double)g_xfer_total;
-        int bar_w = W - 24;
-        if (bar_w < 10)
-            bar_w = 10;
-        int filled = (int)(pct * bar_w);
-        printf("%s║%s  %s%s%s  [", C_CYAN, C_RESET, C_BYEL, g_xfer_name, C_RESET);
-        printf("%s", C_BGREEN);
-        for (int i = 0; i < filled; i++)
-            putchar(':');
-        printf("%s", C_DIM);
-        for (int i = filled; i < bar_w; i++)
-            putchar(':');
-        printf("%s] %s%3.0f%%%s  ", C_RESET, C_BYEL, pct * 100, C_RESET);
-        printf("%s║%s\n", C_CYAN, C_RESET);
-        printf("%s╠", C_CYAN);
-        tui_hline('=', W - 2);
-        printf("╣%s\n", C_RESET);
-    }
-
-    /* ── LOG ── */
-    int log_h = term_h - (menu_visible ? 22 : 16);
-    if (log_h < 3)
-        log_h = 3;
-
-    printf("%s║%s%s  LOG  %s", C_CYAN, C_RESET, C_DIM, C_RESET);
-    for (int i = 0; i < W - 2 - 7; i++)
-        putchar(' ');
-    printf("%s║%s\n", C_CYAN, C_RESET);
-
-    pthread_mutex_lock(&g_log_lock);
-    int start = g_log_count > log_h ? g_log_count - log_h + log_offset : 0;
-    if (start < 0)
-        start = 0;
-    for (int li = 0; li < log_h; li++)
-    {
-        int idx = start + li;
-        printf("%s║%s  ", C_CYAN, C_RESET);
-        if (idx < g_log_count)
-        {
-            LogEntry *e = &g_log[(g_log_head - g_log_count + idx + LOG_LINES) % LOG_LINES];
-            struct tm *tm = localtime(&e->ts);
-            printf("%s%02d:%02d:%02d%s  %s%-*.*s%s",
-                   C_DIM, tm->tm_hour, tm->tm_min, tm->tm_sec, C_RESET,
-                   e->color,
-                   W - 14, W - 14, e->text, C_RESET);
-        }
-        else
-        {
-            for (int i = 0; i < W - 4; i++)
-                putchar(' ');
-        }
-        printf("%s║%s\n", C_CYAN, C_RESET);
-    }
-    pthread_mutex_unlock(&g_log_lock);
-
-    printf("%s╠", C_CYAN);
-    tui_hline('=', W - 2);
-    printf("╣%s\n", C_RESET);
-
-    /* ── MENU ── */
-    printf("%s║%s", C_CYAN, C_RESET);
-    printf("  %s[m]%s msg   %s[b]%s broadcast   %s[f]%s file   %s[B]%s file-broadcast   "
-           "%s[p]%s peers   %s[c]%s connetti   %s[q]%s esci  ",
-           C_BYEL, C_RESET,
-           C_BYEL, C_RESET,
-           C_BYEL, C_RESET,
-           C_BYEL, C_RESET,
-           C_BYEL, C_RESET,
-           C_BYEL, C_RESET,
-           C_BRED, C_RESET);
-    printf("%s║%s\n", C_CYAN, C_RESET);
-
-    printf("%s╚", C_CYAN);
-    tui_hline('=', W - 2);
-    printf("╝%s\n", C_RESET);
-
-    printf("%s> %s", C_BGREEN, C_RESET);
-    fflush(stdout);
+        if (g_data.peers[i].active) send_text(g_data.peers[i].sock, msg);
+    pthread_mutex_unlock(&g_data.peers_lock);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "Me (broadcast): %s", msg);
+    log_to_gui(buf);
+    gtk_editable_set_text(GTK_EDITABLE(g_gui.entry_msg), "");
 }
 
-/* ═══════════════════════════════════════════════════════════
-   INPUT HELPERS
-   ═══════════════════════════════════════════════════════════ */
-static struct termios g_orig_term;
-
-static void term_raw(void)
-{
-    tcgetattr(STDIN_FILENO, &g_orig_term);
-    struct termios raw = g_orig_term;
-    raw.c_lflag &= ~(ECHO | ICANON);
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-}
-
-static void term_restore(void)
-{
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_term);
-}
-
-/* read a line with echo (restores canonical mode temporarily) */
-static int read_line(const char *prompt, char *out, int maxlen)
-{
-    term_restore();
-    printf("%s", prompt);
-    fflush(stdout);
-    if (!fgets(out, maxlen, stdin))
-    {
-        term_raw();
-        return -1;
-    }
-    out[strcspn(out, "\n")] = 0;
-    term_raw();
-    return (int)strlen(out);
-}
-
-/* pick a peer interactively; returns index into peers[] or -1 */
-static int pick_peer(void)
-{
-    pthread_mutex_lock(&peers_lock);
-    int idxs[MAX_PEERS], cnt = 0;
-    for (int i = 0; i < MAX_PEERS; i++)
-        if (peers[i].active)
-            idxs[cnt++] = i;
-
-    if (cnt == 0)
-    {
-        pthread_mutex_unlock(&peers_lock);
-        log_add(C_BRED, "nessun peer connesso");
-        return -1;
-    }
-
-    printf("\n");
-    for (int i = 0; i < cnt; i++)
-        printf("  %s[%d]%s  %s (%s)\n",
-               C_BYEL, i, C_RESET,
-               peers[idxs[i]].name,
-               peers[idxs[i]].ip);
-    pthread_mutex_unlock(&peers_lock);
-
-    char buf[16];
-    if (read_line("  Scegli peer: ", buf, sizeof(buf)) < 0)
-        return -1;
-    int c = atoi(buf);
-    if (c < 0 || c >= cnt)
-        return -1;
-    return idxs[c];
-}
-
-/* ═══════════════════════════════════════════════════════════
-   SIGNAL HANDLER
-   ═══════════════════════════════════════════════════════════ */
-static void on_signal(int sig)
-{
-    (void)sig;
-    g_run = 0;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   MAIN
-   ═══════════════════════════════════════════════════════════ */
-int main(int argc, char **argv)
-{
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGPIPE, SIG_IGN);
-
-    /* args */
-    if (argc >= 2)
-        strncpy(g_myname, argv[1], NAME_LEN - 1);
-    else
-        gethostname(g_myname, NAME_LEN - 1);
-    g_myname[NAME_LEN - 1] = 0;
-
-    if (argc >= 3)
-        g_myport = atoi(argv[2]);
-
-    /* detect local IP */
-    {
-        struct ifaddrs *ifa;
-        if (getifaddrs(&ifa) == 0)
-        {
-            for (struct ifaddrs *i = ifa; i; i = i->ifa_next)
-            {
-                if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET)
-                    continue;
-                struct sockaddr_in *sin = (struct sockaddr_in *)i->ifa_addr;
-                const char *ip = inet_ntoa(sin->sin_addr);
-                if (strcmp(ip, "127.0.0.1") == 0)
-                    continue;
-                strncpy(g_myip, ip, sizeof(g_myip) - 1);
-                break;
+static void on_file_dialog_response(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)user_data;
+    GtkFileDialog *dialog = GTK_FILE_DIALOG(source);
+    GFile *file = gtk_file_dialog_open_finish(dialog, result, NULL);
+    if (file) {
+        char *path = g_file_get_path(file);
+        g_object_unref(file);
+        if (path) {
+            int sock = get_selected_peer_socket();
+            if (sock >= 0) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "Sending file: %s", path);
+                log_to_gui(buf);
+                send_file(sock, path);
+            } else {
+                log_to_gui("No peer selected.");
             }
-            freeifaddrs(ifa);
+            free(path);
         }
-        if (!g_myip[0])
-            strcpy(g_myip, "127.0.0.1");
     }
+}
 
-    /* init TUI */
-    printf(CLEAR HIDE_CUR);
-    tui_size();
-    log_add(C_BGREEN, "avviato — %s  %s:%d", g_myname, g_myip, g_myport);
+static void on_send_file_clicked(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    GtkFileDialog *dialog = gtk_file_dialog_new();
+    gtk_file_dialog_open(dialog, GTK_WINDOW(g_gui.window), NULL,
+                         on_file_dialog_response, NULL);
+    g_object_unref(dialog);
+}
 
-    /* start threads */
+static void on_broadcast_file_response(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)user_data;
+    GtkFileDialog *dialog = GTK_FILE_DIALOG(source);
+    GFile *file = gtk_file_dialog_open_finish(dialog, result, NULL);
+    if (file) {
+        char *path = g_file_get_path(file);
+        g_object_unref(file);
+        if (path) {
+            pthread_mutex_lock(&g_data.peers_lock);
+            for (int i = 0; i < MAX_PEERS; i++)
+                if (g_data.peers[i].active) send_file(g_data.peers[i].sock, path);
+            pthread_mutex_unlock(&g_data.peers_lock);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "Broadcasting file: %s", path);
+            log_to_gui(buf);
+            free(path);
+        }
+    }
+}
+
+static void on_broadcast_file_clicked(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    GtkFileDialog *dialog = gtk_file_dialog_new();
+    gtk_file_dialog_open(dialog, GTK_WINDOW(g_gui.window), NULL,
+                         on_broadcast_file_response, NULL);
+    g_object_unref(dialog);
+}
+
+static void on_connect_response(GtkWidget *dialog, int response, GtkWidget *entry) {
+    if (response == GTK_RESPONSE_ACCEPT) {
+        const char *ip_port = gtk_editable_get_text(GTK_EDITABLE(entry));
+        char ip[INET_ADDRSTRLEN] = {0};
+        int port = g_data.myport;
+        const char *colon = strchr(ip_port, ':');
+        if (colon) {
+            size_t len = colon - ip_port;
+            if (len >= sizeof(ip)) len = sizeof(ip) - 1;
+            memcpy(ip, ip_port, len);
+            ip[len] = '\0';
+            port = atoi(colon + 1);
+        } else {
+            strncpy(ip, ip_port, sizeof(ip) - 1);
+        }
+        if (strlen(ip) > 0) {
+            do_connect(ip, port);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "Connecting to %s:%d ...", ip, port);
+            log_to_gui(buf);
+        }
+    }
+    gtk_window_destroy(GTK_WINDOW(dialog));
+}
+
+static void on_connect_clicked(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    GtkWidget *dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dialog), "Connect to peer");
+    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(g_gui.window));
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_window_set_child(GTK_WINDOW(dialog), box);
+
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "IP:port (e.g. 192.168.1.5:9100)");
+    gtk_box_append(GTK_BOX(box), entry);
+
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_box_append(GTK_BOX(box), btn_box);
+
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), dialog);
+    gtk_box_append(GTK_BOX(btn_box), cancel);
+
+    GtkWidget *ok = gtk_button_new_with_label("Connect");
+    g_signal_connect(ok, "clicked", G_CALLBACK(on_connect_response), entry);
+    gtk_box_append(GTK_BOX(btn_box), ok);
+
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+
+static void activate(GtkApplication *app, gpointer user_data) {
+    (void)user_data;
+    pthread_mutex_init(&g_data.peers_lock, NULL);
+    g_data.running = 1;
+
+    GtkWidget *window = gtk_application_window_new(app);
+    g_gui.window = window;
+    gtk_window_set_title(GTK_WINDOW(window), "P2P Chat & File Transfer");
+    gtk_window_set_default_size(GTK_WINDOW(window), 700, 500);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_window_set_child(GTK_WINDOW(window), vbox);
+
+    char info[128];
+    snprintf(info, sizeof(info), "Name: %s  IP: %s  Port: %d", g_data.myname, g_data.myip, g_data.myport);
+    g_gui.label_info = gtk_label_new(info);
+    gtk_box_append(GTK_BOX(vbox), g_gui.label_info);
+
+    GtkWidget *scroll_peers = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll_peers), 100);
+    g_gui.listbox_peers = gtk_list_box_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll_peers), g_gui.listbox_peers);
+    gtk_box_append(GTK_BOX(vbox), scroll_peers);
+
+    GtkWidget *scroll_log = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll_log), 150);
+    g_gui.textview_log = gtk_text_view_new();
+    g_gui.log_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_gui.textview_log));
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(g_gui.textview_log), FALSE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll_log), g_gui.textview_log);
+    gtk_box_append(GTK_BOX(vbox), scroll_log);
+
+    g_gui.progress_bar = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(g_gui.progress_bar), TRUE);
+    gtk_widget_set_visible(g_gui.progress_bar, FALSE);
+    gtk_box_append(GTK_BOX(vbox), g_gui.progress_bar);
+
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    g_gui.entry_msg = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_gui.entry_msg), "Type message...");
+    gtk_box_append(GTK_BOX(hbox), g_gui.entry_msg);
+    gtk_widget_set_hexpand(g_gui.entry_msg, TRUE);
+
+    GtkWidget *btn_send = gtk_button_new_with_label("Send");
+    g_signal_connect(btn_send, "clicked", G_CALLBACK(on_send_clicked), NULL);
+    gtk_box_append(GTK_BOX(hbox), btn_send);
+
+    GtkWidget *btn_bcast = gtk_button_new_with_label("Broadcast");
+    g_signal_connect(btn_bcast, "clicked", G_CALLBACK(on_broadcast_clicked), NULL);
+    gtk_box_append(GTK_BOX(hbox), btn_bcast);
+
+    gtk_box_append(GTK_BOX(vbox), hbox);
+
+    GtkWidget *hbox2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    GtkWidget *btn_file = gtk_button_new_with_label("Send File...");
+    g_signal_connect(btn_file, "clicked", G_CALLBACK(on_send_file_clicked), NULL);
+    gtk_box_append(GTK_BOX(hbox2), btn_file);
+
+    GtkWidget *btn_bfile = gtk_button_new_with_label("Broadcast File...");
+    g_signal_connect(btn_bfile, "clicked", G_CALLBACK(on_broadcast_file_clicked), NULL);
+    gtk_box_append(GTK_BOX(hbox2), btn_bfile);
+
+    GtkWidget *btn_conn = gtk_button_new_with_label("Connect...");
+    g_signal_connect(btn_conn, "clicked", G_CALLBACK(on_connect_clicked), NULL);
+    gtk_box_append(GTK_BOX(hbox2), btn_conn);
+
+    gtk_box_append(GTK_BOX(vbox), hbox2);
+
+    gtk_window_present(GTK_WINDOW(window));
+
     pthread_t ts, tdr, tds, thb;
     pthread_create(&ts, NULL, thread_tcp_server, NULL);
     pthread_create(&tdr, NULL, thread_disc_responder, NULL);
     pthread_create(&tds, NULL, thread_disc_seeker, NULL);
     pthread_create(&thb, NULL, thread_heartbeat, NULL);
-    pthread_detach(ts);
-    pthread_detach(tdr);
-    pthread_detach(tds);
-    pthread_detach(thb);
+    pthread_detach(ts); pthread_detach(tdr); pthread_detach(tds); pthread_detach(thb);
 
-    /* TUI refresh thread */
-    /* We'll do it from main loop with non-blocking stdin */
-    term_raw();
+    g_timeout_add(1000, periodic_update, NULL);
+}
 
-    int log_offset = 0;
-    time_t last_draw = 0;
-
-    char cmd_buf[1024];
-    int cmd_len = 0;
-
-    while (g_run)
-    {
-        /* redraw every 250ms or on event */
-        time_t now = time(NULL);
-        if (now != last_draw)
-        {
-            printf(CLEAR);
-            draw_screen(log_offset, 0);
-            last_draw = now;
-        }
-
-        /* non-blocking input check */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        struct timeval tv = {0, 250000}; /* 250ms */
-        int sr = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
-        if (sr <= 0)
-            continue;
-
-        char c;
-        if (read(STDIN_FILENO, &c, 1) <= 0)
-            break;
-
-        /* simple single-key dispatch */
-        if (c == 'q' || c == 'Q')
-        {
-            break;
-        }
-        else if (c == 'p' || c == 'P')
-        {
-            /* peers already shown on screen */
-            log_add(C_DIM, "peer count: %d", peer_count());
-        }
-        else if (c == 'm')
-        {
-            /* message to single peer */
-            term_restore();
-            printf("\n");
-            int idx = pick_peer();
-            if (idx >= 0)
-            {
-                char msg[512];
-                if (read_line("  Messaggio: ", msg, sizeof(msg)) > 0)
-                {
-                    pthread_mutex_lock(&peers_lock);
-                    int sock = peers[idx].sock;
-                    char pname[NAME_LEN];
-                    strncpy(pname, peers[idx].name, NAME_LEN - 1);
-                    peers[idx].bytes_sent += strlen(msg);
-                    pthread_mutex_unlock(&peers_lock);
-                    if (send_text(sock, msg) == 0)
-                        log_add(C_BYEL, "→  %s: %s", pname, msg);
-                    else
-                        log_add(C_BRED, "  errore invio msg a %s", pname);
-                }
-            }
-            term_raw();
-            printf(CLEAR);
-        }
-        else if (c == 'b')
-        {
-            /* broadcast text */
-            term_restore();
-            char msg[512];
-            if (read_line("\n  Broadcast: ", msg, sizeof(msg)) > 0 && strlen(msg) > 0)
-            {
-                int sent = 0;
-                pthread_mutex_lock(&peers_lock);
-                for (int i = 0; i < MAX_PEERS; i++)
-                {
-                    if (!peers[i].active)
-                        continue;
-                    peers[i].bytes_sent += strlen(msg);
-                    if (send_text(peers[i].sock, msg) == 0)
-                        sent++;
-                }
-                pthread_mutex_unlock(&peers_lock);
-                log_add(C_BYEL, "→  broadcast: \"%s\"  (%d peer)", msg, sent);
-            }
-            term_raw();
-            printf(CLEAR);
-        }
-        else if (c == 'f')
-        {
-            /* file to single peer */
-            term_restore();
-            printf("\n");
-            int idx = pick_peer();
-            if (idx >= 0)
-            {
-                char path[512];
-                if (read_line("  File path: ", path, sizeof(path)) > 0)
-                {
-                    pthread_mutex_lock(&peers_lock);
-                    int sock = peers[idx].sock;
-                    char pname[NAME_LEN];
-                    strncpy(pname, peers[idx].name, NAME_LEN - 1);
-                    pthread_mutex_unlock(&peers_lock);
-
-                    struct stat st;
-                    if (stat(path, &st) < 0)
-                    {
-                        log_add(C_BRED, "  file non trovato: %s", path);
-                    }
-                    else
-                    {
-                        char sz[24];
-                        fmt_bytes(sz, sizeof(sz), (uint64_t)st.st_size);
-                        log_add(C_BYEL, "→  %s  %s  →  %s", path, sz, pname);
-                        if (send_file(sock, path) == 0)
-                            log_add(C_BGREEN, "  ✓ %s inviato", path);
-                        else
-                            log_add(C_BRED, "  ✗ errore invio %s", path);
-                    }
-                }
-            }
-            term_raw();
-            printf(CLEAR);
-        }
-        else if (c == 'B')
-        {
-            /* broadcast file */
-            term_restore();
-            char path[512];
-            if (read_line("\n  File broadcast path: ", path, sizeof(path)) > 0)
-            {
-                struct stat st;
-                if (stat(path, &st) < 0)
-                {
-                    log_add(C_BRED, "  file non trovato: %s", path);
-                }
-                else
-                {
-                    char sz[24];
-                    fmt_bytes(sz, sizeof(sz), (uint64_t)st.st_size);
-                    int sent = 0;
-                    pthread_mutex_lock(&peers_lock);
-                    int socks[MAX_PEERS], names_idx[MAX_PEERS], scnt = 0;
-                    for (int i = 0; i < MAX_PEERS; i++)
-                        if (peers[i].active)
-                        {
-                            socks[scnt] = peers[i].sock;
-                            names_idx[scnt] = i;
-                            scnt++;
-                        }
-                    pthread_mutex_unlock(&peers_lock);
-
-                    for (int i = 0; i < scnt; i++)
-                    {
-                        log_add(C_BYEL, "→  %s  %s", path, sz);
-                        if (send_file(socks[i], path) == 0)
-                            sent++;
-                        else
-                            log_add(C_BRED, "  ✗ peer %d fallito", i);
-                    }
-                    log_add(C_BGREEN, "  broadcast file: %d/%d peer", sent, scnt);
-                }
-            }
-            term_raw();
-            printf(CLEAR);
-        }
-        else if (c == 'c')
-        {
-            /* manual connect */
-            term_restore();
-            char ipport[64];
-            if (read_line("\n  IP:porta (es. 192.168.1.5:9100): ", ipport, sizeof(ipport)) > 0)
-            {
-                char ip[INET_ADDRSTRLEN] = {0};
-                int port = g_myport;
-                char *colon = strchr(ipport, ':');
-                if (colon)
-                {
-                    *colon = 0;
-                    port = atoi(colon + 1);
-                }
-                strncpy(ip, ipport, sizeof(ip) - 1);
-                log_add(C_DIM, "connessione a %s:%d ...", ip, port);
-                do_connect(ip, port);
-            }
-            term_raw();
-            printf(CLEAR);
-        }
-        else if (c == 'j')
-        {
-            /* scroll log up */
-            log_offset--;
-        }
-        else if (c == 'k')
-        {
-            /* scroll log down */
-            log_offset++;
+static void shutdown_app(void) {
+    g_data.running = 0;
+    pthread_mutex_lock(&g_data.peers_lock);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (g_data.peers[i].active) {
+            proto_send(g_data.peers[i].sock, TYPE_QUIT, NULL, 0);
+            close(g_data.peers[i].sock);
+            g_data.peers[i].active = 0;
         }
     }
+    pthread_mutex_unlock(&g_data.peers_lock);
+}
 
-    /* ── SHUTDOWN ── */
-    g_run = 0;
-    term_restore();
-    printf(SHOW_CUR "\n");
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
 
-    pthread_mutex_lock(&peers_lock);
-    for (int i = 0; i < MAX_PEERS; i++)
-    {
-        if (!peers[i].active)
-            continue;
-        proto_send(peers[i].sock, TYPE_QUIT, NULL, 0);
-        close(peers[i].sock);
-        peers[i].active = 0;
+    if (argc >= 2) strncpy(g_data.myname, argv[1], NAME_LEN - 1);
+    else gethostname(g_data.myname, NAME_LEN - 1);
+    g_data.myname[NAME_LEN - 1] = '\0';
+
+    if (argc >= 3) g_data.myport = atoi(argv[2]);
+    else g_data.myport = TCP_PORT_DEF;
+
+    if (argc >= 4) {
+        strncpy(g_data.myip, argv[3], INET_ADDRSTRLEN - 1);
+    } else {
+        struct ifaddrs *ifa;
+        if (getifaddrs(&ifa) == 0) {
+            for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+                if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+                struct sockaddr_in *sin = (struct sockaddr_in *)i->ifa_addr;
+                const char *ip = inet_ntoa(sin->sin_addr);
+                if (strcmp(ip, "127.0.0.1") == 0) continue;
+                strncpy(g_data.myip, ip, INET_ADDRSTRLEN - 1);
+                break;
+            }
+            freeifaddrs(ifa);
+        }
+        if (!g_data.myip[0]) strcpy(g_data.myip, "127.0.0.1");
     }
-    pthread_mutex_unlock(&peers_lock);
 
-    printf("\n%s  Ciao!%s\n\n", C_BYEL, C_RESET);
-    return 0;
+    GtkApplication *app = gtk_application_new("org.p2pchat.app", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
+
+    int status = g_application_run(G_APPLICATION(app), 0, NULL);
+
+    shutdown_app();
+    g_object_unref(app);
+    return status;
 }
